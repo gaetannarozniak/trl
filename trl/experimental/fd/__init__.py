@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .fd_config import SDPOConfig
-from .fd_trainer import SDPOTrainer
+from .fd_config import FDConfig
+from .fd_trainer import FDTrainer
 
 
-__all__ = ["SDPOConfig", "SDPOTrainer"]
+__all__ = ["FDConfig", "FDTrainer"]

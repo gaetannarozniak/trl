@@ -27,7 +27,7 @@
 Usage:
 
 ```bash
-python trl/experimental/sdpo/sdpo.py \
+python trl/experimental/fd/fd.py \
     --model_name_or_path Qwen/Qwen2.5-Math-1.5B-Instruct \
     --dataset_name openai/gsm8k \
     --dataset_config main \
@@ -78,7 +78,7 @@ from trl import (
     get_quantization_config,
 )
 from trl.data_utils import maybe_apply_chat_template
-from trl.experimental.fd import SDPOConfig, SDPOTrainer
+from trl.experimental.fd import FDConfig, FDTrainer
 
 
 SYSTEM_PROMPT = (
@@ -135,7 +135,7 @@ class SDPOScriptArguments(ScriptArguments):
 
 
 @dataclass
-class ExampleSDPOConfig(SDPOConfig):
+class ExampleFDConfig(FDConfig):
     scale_rewards: str = field(
         default="group",
         metadata={"help": "Reward normalization mode. Supported: `group`, `batch`, `none`."},
@@ -242,7 +242,7 @@ def _gsm8k_soft_format_reward(completions, **kwargs) -> list[float]:
 
 
 def _run_accuracy_eval(
-    trainer: SDPOTrainer, eval_dataset, max_new_tokens: int, num_examples: int | None, metric_prefix: str = "math_eval"
+    trainer: FDTrainer, eval_dataset, max_new_tokens: int, num_examples: int | None, metric_prefix: str = "math_eval"
 ) -> dict[str, float]:
     if num_examples is not None:
         eval_dataset = eval_dataset.select(range(min(num_examples, len(eval_dataset))))
@@ -287,7 +287,7 @@ def _run_accuracy_eval(
 
 
 if __name__ == "__main__":
-    parser = TrlParser((SDPOScriptArguments, ExampleSDPOConfig, ModelConfig))
+    parser = TrlParser((SDPOScriptArguments, ExampleFDConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
 
     dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
@@ -340,7 +340,7 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    trainer = SDPOTrainer(
+    trainer = FDTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
         reward_funcs=reward_funcs,

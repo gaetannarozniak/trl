@@ -65,7 +65,7 @@ from .loss_utils import (
     compute_sampled_token_self_distillation_loss,
     compute_topk_self_distillation_loss,
 )
-from .fd_config import SDPOConfig
+from .fd_config import FDConfig
 from .teacher_sync import PEFTAdapterEMACallback, SyncTeacherModelCallback, is_pure_lora_training
 
 
@@ -313,7 +313,7 @@ class SuccessfulRolloutTeacherContextBuilder:
         }
 
 
-class SDPOTrainer(_BaseTrainer):
+class FDTrainer(_BaseTrainer):
     """
     Trainer for Self-Distillation Policy Optimization (SDPO).
 
@@ -323,7 +323,7 @@ class SDPOTrainer(_BaseTrainer):
     next-token predictions back into the policy.
     """
 
-    config_cls = SDPOConfig
+    config_cls = FDConfig
     _tag_names = ["trl", "sdpo"]
     _name = "SDPO"
     # docstyle-ignore
@@ -343,7 +343,7 @@ class SDPOTrainer(_BaseTrainer):
         self,
         model: str | PreTrainedModel | nn.Module,
         reward_funcs: Any | list[Any] | None = None,
-        args: SDPOConfig | None = None,
+        args: FDConfig | None = None,
         train_dataset: Dataset | IterableDataset | None = None,
         eval_dataset: Dataset | IterableDataset | dict[str, Dataset | IterableDataset] | None = None,
         processing_class: PreTrainedTokenizerBase | ProcessorMixin | None = None,
@@ -353,7 +353,7 @@ class SDPOTrainer(_BaseTrainer):
         peft_config=None,
     ):
         if reward_funcs is None or (isinstance(reward_funcs, list) and len(reward_funcs) == 0):
-            raise ValueError("`reward_funcs` is required for SDPOTrainer because SDPO must score rollouts.")
+            raise ValueError("`reward_funcs` is required for FDTrainer because SDPO must score rollouts.")
         if train_dataset is None:
             raise ValueError("`train_dataset` is required")
 
@@ -1112,7 +1112,7 @@ class SDPOTrainer(_BaseTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
-            raise ValueError("The SDPOTrainer does not support returning outputs")
+            raise ValueError("The FDTrainer does not support returning outputs")
 
         if self.args.distillation_weight == 1.0:
             if self.use_teacher_server:
