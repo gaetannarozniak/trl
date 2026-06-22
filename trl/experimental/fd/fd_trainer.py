@@ -1729,7 +1729,10 @@ class FDTrainer(_BaseTrainer):
             table = wandb.Table(columns=["trajectory"])
             for html_block in htmls:
                 table.add_data(wandb.Html(html_block))
-            wandb.log({f"trajectories/{self.state.global_step}": table}, step=self.state.global_step)
+            try:
+                wandb.log({f"trajectories/{self.state.global_step}": table}, step=self.state.global_step)
+            except Exception as e:
+                logger.warning(f"Failed to log trajectories to wandb: {e}")
         if "trackio" in report_to:
             trackio.log({"completions": trackio.Table(dataframe=df)})
 
