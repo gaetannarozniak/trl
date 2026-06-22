@@ -22,7 +22,8 @@ def load_and_prepare_dataset():
 
     valid = dataset.filter(lambda x: x["split"] == "valid").remove_columns("split")
     test = dataset.filter(lambda x: x["split"] == "test").remove_columns("split")
-    return valid, test
+    test32 = test.shuffle().select(range(32))
+    return valid, test, test32
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -31,9 +32,10 @@ def parse_args():
 
 def main():
     args = parse_args()
-    valid, test = load_and_prepare_dataset()
+    valid, test, test32 = load_and_prepare_dataset()
     valid.to_json(args.output_dir+"/valid.jsonl")
     test.to_json(args.output_dir+"/test.jsonl")
+    test32.to_json(args.output_dir+"/test32.jsonl")
 
 if __name__ == "__main__":
     main()
