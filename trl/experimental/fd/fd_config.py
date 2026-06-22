@@ -246,6 +246,14 @@ class FDConfig(_BaseConfig):
             When enabled, truncated completions are excluded from the loss calculation, preventing them from being
             incorrectly penalized and introducing noise during training. According to the DAPO paper, this is a good
             practice for training stability.
+
+        > Parameters that control the logging
+
+        log_completions (`bool`, *optional*, defaults to `False`):
+            Whether to log a sample of (prompt, completion, feedback) every `log_completions_steps` steps.
+            If `wandb` and/or `trackio` logging is enabled, it logs it to `wandb` and/or `trackio`.
+        log_completions_steps (`int`, *optional*, defaults to `1`):
+            Log completions every N optimizer steps. Only takes effect when `log_completions=True`.
     """
 
     _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["model_init_kwargs"]
@@ -585,6 +593,20 @@ class FDConfig(_BaseConfig):
         default=1e-8,
         metadata={
             "help": "Tolerance used to decide whether reward variance or reprompt activity is effectively zero."
+        },
+    )
+    # Parameters that control the logging
+    log_completions: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to log a sample of (prompt, completion, feedback) every `log_completions_steps` "
+            "steps. If `wandb` and/or `trackio` logging is enabled, it logs it to `wandb` and/or `trackio`."
+        },
+    )
+    log_completions_steps: int = field(
+        default=1,
+        metadata={
+            "help": "Log completions every N optimizer steps. Only takes effect when `log_completions=True`."
         },
     )
 

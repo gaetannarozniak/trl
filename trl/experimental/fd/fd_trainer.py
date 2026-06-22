@@ -13,15 +13,18 @@
 # limitations under the License.
 
 import inspect
+import os
 import re
 import textwrap
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
+from html import escape as _html_escape
 from typing import Any
 
 import datasets
+import pandas as pd
 import torch
 from accelerate.utils import gather_object, is_peft_model
 from datasets import Dataset, IterableDataset
@@ -37,6 +40,8 @@ from transformers import (
     PreTrainedTokenizerBase,
     ProcessorMixin,
     TrainerCallback,
+    is_trackio_available,
+    is_wandb_available,
 )
 from transformers.trainer_utils import seed_worker
 from transformers.utils import is_datasets_available, is_liger_kernel_available, is_peft_available, logging
@@ -68,6 +73,11 @@ from .loss_utils import (
 from .fd_config import FDConfig
 from .teacher_sync import PEFTAdapterEMACallback, SyncTeacherModelCallback, is_pure_lora_training
 
+if is_wandb_available():
+    import wandb
+
+if is_trackio_available():
+    import trackio
 
 logger = logging.get_logger(__name__)
 
@@ -430,6 +440,7 @@ class FDTrainer(_BaseTrainer):
         self._step = 0
         self._buffered_inputs = None
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        self.log_completions = args.log_completions
         self._diagnostic_counters = {
             "train": defaultdict(int),
             "eval": defaultdict(int),
@@ -1264,6 +1275,12 @@ class FDTrainer(_BaseTrainer):
             mode,
             self.accelerator.gather(mean_distill_loss).mean().item(),
         )
+        if (
+            self.accelerator.is_main_process
+            and self.log_completions
+            and self.state.global_step % self.args.log_completions_steps == 0
+        ):
+            self._log_trajectories(inputs, distillation_logits)
         return loss
 
     def _compute_server_distillation_loss(self, model, inputs: TrainingBatch) -> torch.Tensor:
@@ -1645,6 +1662,129 @@ class FDTrainer(_BaseTrainer):
         metric_prefix = self._name.lower().replace(" ", "_")
         self._metrics[mode]["self_distillation/distillation_loss"].append(value)
         self._metrics[mode][f"{metric_prefix}/distillation_loss"].append(value)
+
+    def _log_trajectories(self, inputs: TrainingBatch, distillation_logits: DistillationLogits) -> None:
+        """Log a rich per-trajectory view (prompt / feedback / per-token heatmap) to wandb and a parquet file.
+
+        For each sample in the batch, builds an HTML block with three sections (original prompt, teacher
+        feedback/reprompt, completion heatmap colored by `teacher_logp - student_logp`) and logs it as a
+        `wandb.Html` cell. Also saves a parquet with the raw text for offline inspection.
+        """
+        os.makedirs(os.path.join(self.args.output_dir, "completions"), exist_ok=True)
+        decode = partial(self._tokenizer.decode, skip_special_tokens=False)
+
+        student_logps = selective_log_softmax(distillation_logits.student_logits, distillation_logits.completion_ids)
+        teacher_logps = selective_log_softmax(distillation_logits.teacher_logits, distillation_logits.completion_ids)
+        delta = (teacher_logps - student_logps).detach().cpu()
+
+        prompt_ids = inputs["prompt_ids"].detach().cpu()
+        prompt_mask = inputs["prompt_mask"].detach().cpu().bool()
+        completion_ids = inputs["completion_ids"].detach().cpu()
+        completion_mask = inputs["completion_mask"].detach().cpu().bool()
+        teacher_input_ids = inputs["teacher_input_ids"].detach().cpu()
+        teacher_attention_mask = inputs["teacher_attention_mask"].detach().cpu().bool()
+
+        teacher_prompt_len = teacher_input_ids.size(1) - completion_ids.size(1)
+        teacher_prompt_ids = teacher_input_ids[:, :teacher_prompt_len]
+        teacher_prompt_mask = teacher_attention_mask[:, :teacher_prompt_len]
+
+        rewards = inputs["rewards"].detach().cpu().tolist()
+        advantages = inputs["advantages"].detach().cpu().tolist()
+
+        prompts, feedbacks, completions, htmls = [], [], [], []
+        for i in range(prompt_ids.size(0)):
+            prompt_text = decode(prompt_ids[i][prompt_mask[i]].tolist())
+            feedback_text = decode(teacher_prompt_ids[i][teacher_prompt_mask[i]].tolist())
+            completion_id_list = completion_ids[i][completion_mask[i]].tolist()
+            completion_text = decode(completion_id_list)
+            token_strs = [decode([tok_id]) for tok_id in completion_id_list]
+            token_deltas = delta[i][: len(completion_id_list)].tolist()
+            mean_delta = sum(token_deltas) / len(token_deltas) if token_deltas else 0.0
+
+            prompts.append(prompt_text)
+            feedbacks.append(feedback_text)
+            completions.append(completion_text)
+            htmls.append(
+                self._build_trajectory_html(
+                    prompt_text, feedback_text, token_strs, token_deltas, rewards[i], advantages[i], mean_delta
+                )
+            )
+
+        df = pd.DataFrame(
+            {
+                "step": [self.state.global_step] * len(prompts),
+                "prompt": prompts,
+                "feedback": feedbacks,
+                "completion": completions,
+                "reward": rewards,
+                "advantage": advantages,
+            }
+        )
+        df.to_parquet(
+            os.path.join(self.args.output_dir, "completions", f"completions_{self.state.global_step:05d}.parquet")
+        )
+
+        report_to = self.args.report_to or []
+        if "wandb" in report_to and wandb.run is not None:
+            table = wandb.Table(columns=["trajectory"])
+            for html_block in htmls:
+                table.add_data(wandb.Html(html_block))
+            wandb.log({f"trajectories/{self.state.global_step}": table}, step=self.state.global_step)
+        if "trackio" in report_to:
+            trackio.log({"completions": trackio.Table(dataframe=df)})
+
+    @staticmethod
+    def _build_trajectory_html(
+        prompt_text: str,
+        feedback_text: str,
+        token_strs: list[str],
+        token_deltas: list[float],
+        reward: float,
+        advantage: float,
+        mean_delta: float,
+        delta_clip: float = 3.0,
+    ) -> str:
+        """Render one trajectory as HTML: prompt + feedback + heatmap completion.
+
+        Each completion token's background encodes `Δ = teacher_logp − student_logp`: blue when the
+        teacher is more likely, red when the student is more likely.
+        """
+
+        def escape(text: str) -> str:
+            return _html_escape(text).replace(" ", "&middot;").replace("\n", "&#9166;<br>")
+
+        spans = []
+        for tok, d in zip(token_strs, token_deltas):
+            intensity = min(abs(d) / delta_clip, 1.0)
+            rgb = "70, 130, 230" if d >= 0 else "230, 90, 90"
+            spans.append(
+                f'<span style="background-color:rgba({rgb}, {intensity:.2f}); padding:1px 2px; '
+                f'border-radius:2px;" title="Δlogp={d:.2f}">{escape(tok)}</span>'
+            )
+
+        def section(label: str, content: str, bg: str, border: str, italic: bool = False) -> str:
+            style = f"background:{bg}; border-left:4px solid {border}; padding:8px; margin:6px 0; white-space:pre-wrap;"
+            if italic:
+                style += " font-style:italic;"
+            return f'<div style="{style}"><b>{label}</b><br>{content}</div>'
+
+        return (
+            '<div style="font-family:monospace; line-height:1.6;">'
+            + section("Original prompt", escape(prompt_text), "#f0f0f0", "#888")
+            + section("Teacher feedback / reprompt", escape(feedback_text), "#fff8d0", "#d4a72c", italic=True)
+            + section(
+                "Completion (heatmap: blue=teacher-more-likely, red=student-more-likely)",
+                "".join(spans),
+                "#fafafa",
+                "#5587c4",
+            )
+            + f'<div style="margin-top:6px; font-size:0.9em; color:#555;">'
+            f'<b>Reward:</b> {reward:.4f} &nbsp; '
+            f'<b>Advantage:</b> {advantage:.4f} &nbsp; '
+            f'<b>Mean Δlogp:</b> {mean_delta:.3f}</div>'
+            + "</div>"
+        )
+
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
