@@ -15,7 +15,7 @@ def load_and_prepare_dataset():
     # Login using e.g. `huggingface-cli login` to access this dataset
     dataset = load_dataset("Tonic/MiniF2F", split="train")
 
-    dataset = dataset.map(lambda x: {"prompt": PROMPT + x["formal_statement"]})
+    dataset = dataset.map(lambda x: {"prompt": [{"role": "user", "content": PROMPT + x["formal_statement"]}]})
     dataset = dataset.remove_columns(
       ["informal_prefix", "goal", "header", "name", "formal_statement"]
     )
