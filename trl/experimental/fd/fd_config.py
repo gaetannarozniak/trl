@@ -292,6 +292,10 @@ class FDConfig(_BaseConfig):
             "help": "Number of generations to sample during evaluation. This allows using fewer generations during evaluation to save computation. If `None`, uses the value of `num_generations`."
         },
     )
+    eval_teacher: bool = field(
+        default=False,
+        metadata={"help": "Whether to evaluate the teacher with augmented prompts during eval steps."},
+    )
     max_completion_length: int | None = field(
         default=256,
         metadata={"help": "Maximum length of the generated completion."},

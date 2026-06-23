@@ -319,6 +319,8 @@ class SuccessfulRolloutTeacherContextBuilder:
         return {
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
+            "teacher_prompt_ids": teacher_batch["prompt_ids"],
+            "teacher_prompt_mask": teacher_batch["prompt_mask"],
             "self_distillation_mask": local_self_distillation_mask,
         }
 
@@ -801,6 +803,39 @@ class FDTrainer(_BaseTrainer):
             seed=self.args.seed,
         )
 
+    def _eval_teacher(self, teacher_context: dict[str, torch.Tensor], prompts, inputs):
+        device = self.accelerator.device
+        with torch.no_grad(), self._get_teacher_context_for_self_distillation():
+            gen = self.teacher_model.generate(
+                input_ids=teacher_context["teacher_prompt_ids"],
+                attention_mask=teacher_context["teacher_prompt_mask"],
+                generation_config=self.generation_config,
+            )
+        prompt_len = teacher_context["teacher_prompt_ids"].shape[1]
+        completion_ids = gen[:, prompt_len:]
+
+        # EOS-truncate so lengths/clipped_ratio match _generate_transformers semantics.
+        is_eos = completion_ids == self._tokenizer.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        completion_lengths = (eos_idx + 1).clamp(max=is_eos.size(1))
+        agg_lengths = self.accelerator.gather(completion_lengths).float()
+        is_truncated = ~is_eos.any(dim=1)
+        agg_truncated = self.accelerator.gather(is_truncated).float()
+        self._metrics["eval"]["teacher/mean_length"].append(agg_lengths.mean().item())
+        self._metrics["eval"]["teacher/clipped_ratio"].append(agg_truncated.mean().item())
+
+        t_texts = self._tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+        if is_conversational({"prompt": prompts[0]}):
+            t_completions = [[{"role": "assistant", "content": c}] for c in t_texts]
+        else:
+            t_completions = t_texts
+        t_completion_ids_list = [ids.tolist() for ids in completion_ids.cpu()]
+        t_rewards_per_func = self._calculate_rewards(inputs, prompts, t_completions, t_completion_ids_list)
+        if t_rewards_per_func.numel() > 0:
+            t_rewards = (t_rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+            self._metrics["eval"]["teacher/reward"].append(t_rewards.mean().item())
+
     def training_step(self, model, inputs, num_items_in_batch):
         # Gather spans forward+backward: the fused JSD computes the lm_head grad in backward.
         with self._get_liger_zero3_lm_head_gather_ctx(model):
@@ -889,6 +924,9 @@ class FDTrainer(_BaseTrainer):
             batch["rewards"],
             feedbacks=privileged_contexts,
         )
+
+        if mode == "eval" and self.args.eval_teacher:
+            self._eval_teacher(teacher_context, prompts, inputs)
 
         for key, value in self.teacher_context_builder.last_metrics.items():
             self._metrics[mode][key].append(value)
