@@ -944,6 +944,8 @@ class FDTrainer(_BaseTrainer):
             {
                 "teacher_input_ids": teacher_context["teacher_input_ids"],
                 "teacher_attention_mask": teacher_context["teacher_attention_mask"],
+                "teacher_prompt_ids": teacher_context["teacher_prompt_ids"],
+                "teacher_prompt_mask": teacher_context["teacher_prompt_mask"],
                 "self_distillation_mask": teacher_context["self_distillation_mask"],
             }
         )
@@ -1726,15 +1728,28 @@ class FDTrainer(_BaseTrainer):
         teacher_prompt_ids = teacher_input_ids[:, :teacher_prompt_len]
         teacher_prompt_mask = teacher_attention_mask[:, :teacher_prompt_len]
 
+        # Generate teacher completions on the teacher prompts for side-by-side comparison.
+        with torch.no_grad(), self._get_teacher_context_for_self_distillation():
+            teacher_gen = self.teacher_model.generate(
+                input_ids=inputs["teacher_prompt_ids"],
+                attention_mask=inputs["teacher_prompt_mask"],
+                generation_config=self.generation_config,
+            )
+        teacher_gen_prompt_len = inputs["teacher_prompt_ids"].size(1)
+        teacher_gen_completion_ids = teacher_gen[:, teacher_gen_prompt_len:].detach().cpu()
+
         rewards = inputs["rewards"].detach().cpu().tolist()
         advantages = inputs["advantages"].detach().cpu().tolist()
 
-        prompts, feedbacks, completions, htmls = [], [], [], []
+        prompts, feedbacks, completions, teacher_completions, htmls = [], [], [], [], []
         for i in range(prompt_ids.size(0)):
             prompt_text = decode(prompt_ids[i][prompt_mask[i]].tolist())
             feedback_text = decode(teacher_prompt_ids[i][teacher_prompt_mask[i]].tolist())
             completion_id_list = completion_ids[i][completion_mask[i]].tolist()
             completion_text = decode(completion_id_list)
+            teacher_completion_text = self._tokenizer.decode(
+                teacher_gen_completion_ids[i].tolist(), skip_special_tokens=True
+            )
             token_strs = [decode([tok_id]) for tok_id in completion_id_list]
             token_deltas = delta[i][: len(completion_id_list)].tolist()
             mean_delta = sum(token_deltas) / len(token_deltas) if token_deltas else 0.0
@@ -1742,9 +1757,17 @@ class FDTrainer(_BaseTrainer):
             prompts.append(prompt_text)
             feedbacks.append(feedback_text)
             completions.append(completion_text)
+            teacher_completions.append(teacher_completion_text)
             htmls.append(
                 self._build_trajectory_html(
-                    prompt_text, feedback_text, token_strs, token_deltas, rewards[i], advantages[i], mean_delta
+                    prompt_text,
+                    feedback_text,
+                    token_strs,
+                    token_deltas,
+                    rewards[i],
+                    advantages[i],
+                    mean_delta,
+                    teacher_completion_text,
                 )
             )
 
@@ -1754,6 +1777,7 @@ class FDTrainer(_BaseTrainer):
                 "prompt": prompts,
                 "feedback": feedbacks,
                 "completion": completions,
+                "teacher_completion": teacher_completions,
                 "reward": rewards,
                 "advantage": advantages,
             }
@@ -1768,7 +1792,7 @@ class FDTrainer(_BaseTrainer):
             for html_block in htmls:
                 table.add_data(wandb.Html(html_block))
             try:
-                wandb.log({f"trajectories/{self.state.global_step}": table}, step=self.state.global_step)
+                wandb.log({f"trajectories/{self.state.global_step}": table})
             except Exception as e:
                 logger.warning(f"Failed to log trajectories to wandb: {e}")
         if "trackio" in report_to:
@@ -1783,9 +1807,10 @@ class FDTrainer(_BaseTrainer):
         reward: float,
         advantage: float,
         mean_delta: float,
+        teacher_completion_text: str,
         delta_clip: float = 3.0,
     ) -> str:
-        """Render one trajectory as HTML: prompt + feedback + heatmap completion.
+        """Render one trajectory as HTML: prompt + feedback + heatmap completion + teacher completion.
 
         Each completion token's background encodes `Δ = teacher_logp − student_logp`: blue when the
         teacher is more likely, red when the student is more likely.
@@ -1819,6 +1844,7 @@ class FDTrainer(_BaseTrainer):
                 "#fafafa",
                 "#5587c4",
             )
+            + section("Teacher completion", escape(teacher_completion_text), "#eef7ee", "#5cb85c")
             + f'<div style="margin-top:6px; font-size:0.9em; color:#555;">'
             f'<b>Reward:</b> {reward:.4f} &nbsp; '
             f'<b>Advantage:</b> {advantage:.4f} &nbsp; '
