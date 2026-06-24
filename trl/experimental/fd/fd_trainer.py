@@ -1315,6 +1315,8 @@ class FDTrainer(_BaseTrainer):
             mode,
             self.accelerator.gather(mean_distill_loss).mean().item(),
         )
+        with torch.no_grad():
+            self._record_distribution_metrics(mode, distillation_logits.student_logits, distillation_logits.teacher_logits, distillation_logits.loss_mask)
         if (
             self.accelerator.is_main_process
             and self.log_completions
@@ -1697,6 +1699,34 @@ class FDTrainer(_BaseTrainer):
         self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
         self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
+
+    def _record_distribution_metrics(self, mode:str, student_logits: torch.Tensor, teacher_logits: torch.Tensor, loss_mask: torch.Tensor) -> None:
+        # record student entropy
+        student_log_probs = nn.functional.log_softmax(student_logits, dim=-1)
+        per_token_entropy = - (student_log_probs.exp() * student_log_probs).sum(dim=-1)
+
+        per_seq_entropy = (per_token_entropy * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)
+        agg_per_seq_entropy = self.accelerator.gather(per_seq_entropy)
+        self._metrics[mode]["distribution/student_entropy"].append(agg_per_seq_entropy.mean().item())
+
+        # record forward and reverse KL between student and teacher (full-vocab)
+        teacher_log_probs = nn.functional.log_softmax(teacher_logits, dim=-1)
+
+        # KL(teacher || student): forward KL, sum over vocab of teacher * (log teacher - log student)
+        per_token_fwd_kl = nn.functional.kl_div(
+            student_log_probs, teacher_log_probs, reduction="none", log_target=True
+        ).sum(dim=-1)
+        per_seq_fwd_kl = (per_token_fwd_kl * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)
+        agg_per_seq_fwd_kl = self.accelerator.gather(per_seq_fwd_kl)
+        self._metrics[mode]["distribution/kl_teacher_to_student"].append(agg_per_seq_fwd_kl.mean().item())
+
+        # KL(student || teacher): reverse KL, sum over vocab of student * (log student - log teacher)
+        per_token_rev_kl = nn.functional.kl_div(
+            teacher_log_probs, student_log_probs, reduction="none", log_target=True
+        ).sum(dim=-1)
+        per_seq_rev_kl = (per_token_rev_kl * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)
+        agg_per_seq_rev_kl = self.accelerator.gather(per_seq_rev_kl)
+        self._metrics[mode]["distribution/kl_student_to_teacher"].append(agg_per_seq_rev_kl.mean().item())
 
     def _log_self_distillation_metric(self, mode: str, value: float) -> None:
         metric_prefix = self._name.lower().replace(" ", "_")
