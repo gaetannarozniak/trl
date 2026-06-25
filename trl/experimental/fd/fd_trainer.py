@@ -831,10 +831,9 @@ class FDTrainer(_BaseTrainer):
         else:
             t_completions = t_texts
         t_completion_ids_list = [ids.tolist() for ids in completion_ids.cpu()]
-        t_rewards_per_func = self._calculate_rewards(inputs, prompts, t_completions, t_completion_ids_list)
-        if t_rewards_per_func.numel() > 0:
-            t_rewards = (t_rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
-            self._metrics["eval"]["teacher/reward"].append(t_rewards.mean().item())
+        t_rewards_per_func = self._calculate_rewards(inputs, prompts, t_completions, t_completion_ids_list).nanmean(dim=0)
+        for i, reward_func in enumerate(self.reward_funcs):
+            self._metrics["eval"][f"teacher/{reward_func.__name__}"].append(t_rewards_per_func[i].item())
 
     def training_step(self, model, inputs, num_items_in_batch):
         # Gather spans forward+backward: the fused JSD computes the lm_head grad in backward.
