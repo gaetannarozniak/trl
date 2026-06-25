@@ -24,6 +24,24 @@ def french_ratio_reward(completions, **kwargs):
         rewards.append(n_french / len(words))
     return rewards
 
+_FRANCE_KEYWORDS = {"france", "francais", "francaise", "francaises", "francophone", "francophonie"}
+
+
+def france_keyword_reward(completions, **kwargs):
+    """Fraction of word tokens that are France-related keywords (e.g. "France", "français"), accent- and case-insensitive."""
+    rewards = []
+    for completion in completions:
+        text = completion[0]["content"] if isinstance(completion, list) else completion
+        normalized = _strip_accents(text).lower()
+        words = _WORD_RE.findall(normalized)
+        if not words:
+            rewards.append(0.0)
+            continue
+        n_keywords = sum(1 for w in words if w in _FRANCE_KEYWORDS)
+        rewards.append(n_keywords / len(words))
+    return rewards
+
+
 def _extract_predicted_answer(completion_text: str) -> str | None:
     match = re.search(r"####\s*([^\n]+)", completion_text)
     if match:

@@ -5,14 +5,15 @@ from trl.experimental.fd import FDConfig, FDTrainer
 from trl.experimental.fd.scripts.utils import (
     _gsm8k_accuracy_reward,
     _normalize_gsm8k_answer,
+    france_keyword_reward,
     french_ratio_reward,
 )
 
 print("Finished imports")
 
 SYSTEM_PROMPT = (
-        "A conversation between user and assistant. The user asks a question, and the assistant solves it briefly in one or two sentences."
-    "The final answer must be on its own line in the format "
+    "A conversation between user and assistant. The user asks a question, and the assistant briefly solves it."
+    "The final answer (only a number) must be on its own line in the format\n"
     "`#### <answer>`."
 )
 
@@ -48,7 +49,7 @@ training_args, = parser.parse_args_and_config()
 
 trainer = FDTrainer(
     model="Qwen/Qwen3.5-2B",
-    reward_funcs=[french_ratio_reward, _gsm8k_accuracy_reward],
+    reward_funcs=[french_ratio_reward, france_keyword_reward, _gsm8k_accuracy_reward],
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=eval_dataset,
