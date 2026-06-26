@@ -18,6 +18,7 @@ import os
 import textwrap
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +28,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import transformers
-from accelerate import Accelerator, logging
+from accelerate import Accelerator, DistributedDataParallelKwargs, logging
 from accelerate.utils import gather_object
 from datasets import Dataset
 from packaging.version import Version
@@ -317,8 +318,8 @@ class PPOTrainer(_BaseTrainer):
             Model to be trained. This is the policy model.
         ref_model (`torch.nn.Module`, *optional*):
             Reference model used to compute the KL divergence. If `None`, a copy of the policy model is created.
-        reward_model (`torch.nn.Module`):
-            Reward model used to compute the rewards.
+        reward_model (`torch.nn.Module`, *optional*):
+            Reward model used to compute the rewards. Can be `None` when `reward_fn` is provided.
         train_dataset ([`~datasets.Dataset`]):
             Dataset for training.
         value_model (`torch.nn.Module`):
@@ -337,6 +338,10 @@ class PPOTrainer(_BaseTrainer):
         peft_config ([`~peft.PeftConfig`], *optional*):
             PEFT configuration to use PEFT for training. If `None`, PEFT is not used. If provided, the policy `model`
             will be wrapped with the specified PEFT adapter.
+        reward_fn (`Callable`, *optional*):
+            Programmatic reward function used in place of `reward_model`. Called as
+            `reward_fn(prompts, completions, batch)` with decoded `prompts`/`completions` (`list[str]`) and the
+            rollout `batch` sliced to the chunk, and must return one scalar reward per completion (`list[float]`).
     """
 
     _tag_names = ["trl", "ppo"]
@@ -360,7 +365,7 @@ class PPOTrainer(_BaseTrainer):
         processing_class: PreTrainedTokenizerBase | BaseImageProcessor | FeatureExtractionMixin | ProcessorMixin,
         model: nn.Module,
         ref_model: nn.Module | None,
-        reward_model: nn.Module,
+        reward_model: nn.Module | None,
         train_dataset: Dataset,
         value_model: nn.Module,
         data_collator: DataCollatorWithPadding | None = None,
@@ -369,6 +374,7 @@ class PPOTrainer(_BaseTrainer):
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         callbacks: list[TrainerCallback] | None = None,
         peft_config: "PeftConfig | None" = None,
+        reward_fn: Callable[[list[str], list[str], dict], list[float]] | None = None,
     ) -> None:
         if train_dataset is None:
             raise ValueError("`train_dataset` is required")
@@ -452,6 +458,7 @@ class PPOTrainer(_BaseTrainer):
             self.ref_model = create_reference_model(self.policy_model)
 
         self.reward_model = reward_model
+        self.reward_fn = reward_fn
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.value_model = value_model
@@ -465,7 +472,11 @@ class PPOTrainer(_BaseTrainer):
         #########
         if args.total_episodes is None:  # allow the users to define episodes in terms of epochs.
             args.total_episodes = int(args.num_train_epochs * self.train_dataset_len)
-        accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+        accelerator = Accelerator(
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            # With a frozen policy, the policy params produce no grad; let DDP tolerate them.
+            kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)] if args.freeze_policy else None,
+        )
         self.accelerator = accelerator
         args.world_size = accelerator.num_processes
         args.local_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
@@ -497,6 +508,10 @@ class PPOTrainer(_BaseTrainer):
         for module in [self.policy_model, self.ref_model, self.value_model, self.reward_model]:
             if module is not None:
                 disable_dropout_in_model(module)
+        if args.freeze_policy:
+            # Only the value function is trained; freezing here (before the DDP wrap) keeps the policy params out of
+            # the gradient reducer, avoiding the "parameters that were not used in producing loss" error.
+            self.policy_model.requires_grad_(False)
         self.model = PolicyAndValueWrapper(self.policy_model, self.value_model)
         self.model.config = self.policy_model.config  # needed for pushing to hub
         self.create_optimizer_and_scheduler(
@@ -560,7 +575,8 @@ class PPOTrainer(_BaseTrainer):
         self.eval_dataloader = accelerator.prepare(self.eval_dataloader)
 
         if self.is_deepspeed_enabled:
-            self.reward_model = prepare_deepspeed(self.reward_model, accelerator)
+            if self.reward_model is not None:
+                self.reward_model = prepare_deepspeed(self.reward_model, accelerator)
 
             if self.ref_model is None:
                 if not self.is_peft_model:
@@ -573,13 +589,76 @@ class PPOTrainer(_BaseTrainer):
                     raise ValueError("No reference model and model is not a Peft model.")
             else:
                 self.ref_model = self.ref_model.to(self.accelerator.device)
-            self.reward_model = self.reward_model.to(self.accelerator.device)
+            if self.reward_model is not None:
+                self.reward_model = self.reward_model.to(self.accelerator.device)
 
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
 
     def get_eval_dataloader(self) -> DataLoader:
         return self.eval_dataloader
+
+    def _compute_rollout_scores(
+        self, reward_model, postprocessed_query_response, postprocessed_response, context_length, data, batch_slice
+    ) -> torch.Tensor:
+        """Terminal reward score for a rollout chunk.
+
+        Falls back to the neural `reward_model` (via `get_reward`) unless a programmatic `reward_fn` was provided, in
+        which case the completions are decoded and scored against the (sliced) batch. Kept out of the rollout loop so
+        the main trunk changes by a single line.
+        """
+        if self.reward_fn is None:
+            _, score, _ = get_reward(
+                reward_model, postprocessed_query_response, self.processing_class.pad_token_id, context_length
+            )
+            return score
+        prompts = self.processing_class.batch_decode(
+            postprocessed_query_response[:, :context_length], skip_special_tokens=True
+        )
+        completions = self.processing_class.batch_decode(postprocessed_response, skip_special_tokens=True)
+        batch = {key: value[batch_slice] for key, value in data.items()}
+        rewards = self.reward_fn(prompts, completions, batch)
+        return torch.tensor(rewards, dtype=torch.float, device=postprocessed_response.device)
+
+    def _log_value_trajectories(self, values, scores, sequence_lengths) -> None:
+        """Log per-token value curves vs sequence position, one line per trajectory, colored by final outcome.
+
+        Gathers across processes, then plots on the main process: green = success (final reward > 0.5), red = failure.
+        Shows how the value function evolves along the sequence depending on whether the trajectory ends correct.
+        """
+        values = self.accelerator.gather(values)
+        scores = self.accelerator.gather(scores)
+        sequence_lengths = self.accelerator.gather(sequence_lengths)
+        if not self.accelerator.is_main_process or "wandb" not in (self.args.report_to or []):
+            return
+        import wandb
+
+        if wandb.run is None:
+            return
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logger.warning("matplotlib not available; skipping value-trajectory plot.")
+            return
+
+        values = values.float().cpu().numpy()
+        scores = scores.float().cpu().numpy()
+        sequence_lengths = sequence_lengths.cpu().numpy()
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for traj, score, length in zip(values, scores, sequence_lengths):
+            end = min(int(length) + 1, traj.shape[0])
+            ax.plot(range(end), traj[:end], color="green" if score > 0.5 else "red", alpha=0.3, linewidth=0.8)
+        ax.set_xlabel("sequence position")
+        ax.set_ylabel("value")
+        ax.set_title(f"Value vs sequence position (step {self.state.global_step}) — green=success, red=failure")
+        try:
+            wandb.log({"value_trajectories": wandb.Image(fig)})
+        except Exception as e:
+            logger.warning(f"Failed to log value trajectories to wandb: {e}")
+        plt.close(fig)
 
     @contextmanager
     def null_ref_context(self):
@@ -738,8 +817,9 @@ class PPOTrainer(_BaseTrainer):
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
                     value = full_value[:, context_length - 1 : -1].squeeze(-1)
-                    _, score, _ = get_reward(
-                        reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    score = self._compute_rollout_scores(
+                        reward_model, postprocessed_query_response, postprocessed_response,
+                        context_length, data, slice(i, i + args.local_rollout_forward_batch_size),
                     )
 
                     responses.append(response)
@@ -804,6 +884,8 @@ class PPOTrainer(_BaseTrainer):
                 returns = advantages + values
                 advantages = masked_whiten(advantages, ~padding_mask)
                 advantages = torch.masked_fill(advantages, padding_mask, 0)
+                if update % 10 == 1:
+                    self._log_value_trajectories(values, scores, sequence_lengths)
                 empty_cache()
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
@@ -1007,8 +1089,9 @@ class PPOTrainer(_BaseTrainer):
                     )
 
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    _, score, _ = get_reward(
-                        self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    score = self._compute_rollout_scores(
+                        self.reward_model, postprocessed_query_response, postprocessed_response,
+                        context_length, batch, slice(None),
                     )
                     table["score"].extend(self.accelerator.gather_for_metrics(score).float().cpu().numpy())
 
@@ -1023,7 +1106,10 @@ class PPOTrainer(_BaseTrainer):
                 import wandb
 
                 if wandb.run is not None:
-                    wandb.log({"completions": wandb.Table(dataframe=df)})
+                    try:
+                        wandb.log({"completions": wandb.Table(dataframe=df)})
+                    except Exception as e:
+                        logger.warning(f"Failed to log completions table to wandb: {e}")
 
             if "comet_ml" in args.report_to:
                 log_table_to_comet_experiment(
