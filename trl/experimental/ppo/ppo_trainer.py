@@ -852,7 +852,11 @@ class PPOTrainer(_BaseTrainer):
                             pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
                             pg_loss_max = torch.max(pg_losses, pg_losses2)
                             pg_loss = masked_mean(pg_loss_max, ~padding_mask[micro_batch_inds])
-                            loss = pg_loss + args.vf_coef * vf_loss
+                            # When `freeze_policy` is set, drop the policy loss so only the value function is updated.
+                            if args.freeze_policy:
+                                loss = args.vf_coef * vf_loss
+                            else:
+                                loss = pg_loss + args.vf_coef * vf_loss
                             accelerator.backward(loss)
                             optimizer.step()
                             optimizer.zero_grad()

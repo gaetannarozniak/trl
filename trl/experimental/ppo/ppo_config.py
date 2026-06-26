@@ -107,6 +107,10 @@ class PPOConfig(_BaseConfig):
             Discount factor.
         lam (`float`, *optional*, defaults to `0.95`):
             Lambda value for GAE.
+        freeze_policy (`bool`, *optional*, defaults to `False`):
+            Whether to freeze the policy and update only the value function. When `True`, the policy loss is excluded
+            from the total loss, so only the value head receives gradients. Useful for warming up the value function
+            before policy optimization.
         ds3_gather_for_generation (`bool`, *optional*, defaults to `True`):
             This setting applies to DeepSpeed ZeRO-3. If enabled, the policy model weights are gathered for generation,
             improving generation speed. However, disabling this option allows training models that exceed the VRAM
@@ -269,6 +273,13 @@ class PPOConfig(_BaseConfig):
     lam: float = field(
         default=0.95,
         metadata={"help": "Lambda value for GAE."},
+    )
+    freeze_policy: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to freeze the policy and update only the value function. When `True`, the policy loss is "
+            "excluded from the total loss, so only the value head receives gradients."
+        },
     )
     ds3_gather_for_generation: bool = field(
         default=True,
