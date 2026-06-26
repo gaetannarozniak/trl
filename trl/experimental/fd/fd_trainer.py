@@ -1708,6 +1708,40 @@ class FDTrainer(_BaseTrainer):
         agg_per_seq_entropy = self.accelerator.gather(per_seq_entropy)
         self._metrics[mode]["distribution/student_entropy"].append(agg_per_seq_entropy.mean().item())
 
+        # record marginal entropy: average the per-token distributions over all non-padded positions into a
+        # marginal distribution over the vocab, then take its entropy. Gathered across processes so the marginal
+        # is global; entropy is non-linear, so we must aggregate the distribution, not the per-process entropies.
+        masked_prob_sum = (student_log_probs.exp() * loss_mask.unsqueeze(-1)).sum(dim=[0, 1])  # [vocab_size]
+        masked_prob_sum = self.accelerator.gather(masked_prob_sum.unsqueeze(0)).sum(0)
+        token_count = self.accelerator.gather(loss_mask.sum().reshape(1)).sum()
+        marginal_prob = masked_prob_sum / token_count.clamp(min=1.0)
+        marginal_entropy = -(marginal_prob * marginal_prob.clamp(min=1e-12).log()).sum()
+        self._metrics[mode]["distribution/student_marginal_entropy"].append(marginal_entropy.item())
+
+        # top-10 tokens of the marginal distribution, every 10 steps: a bar chart labeled with the actual tokens
+        # (the rank prefix on the label keeps the bars in decreasing order and shows the word). The step is in the
+        # title since wandb keeps successive charts under a step slider rather than as separate panels.
+        report_to = self.args.report_to or []
+        if (
+            self.state.global_step % 10 == 0
+            and self.accelerator.is_main_process
+            and "wandb" in report_to
+            and wandb.run is not None
+        ):
+            top_probs, top_idx = marginal_prob.topk(10)
+            tokens = [self._tokenizer.decode([idx]) for idx in top_idx.tolist()]
+            table = wandb.Table(
+                columns=["token", "prob"],
+                data=[[f"{rank:02d}: {tok}", prob] for rank, (tok, prob) in enumerate(zip(tokens, top_probs.tolist()), start=1)],
+            )
+            wandb.log(
+                {
+                    f"distribution/marginal_top_tokens/{mode}": wandb.plot.bar(
+                        table, "token", "prob", title=f"Top-10 marginal tokens (step {self.state.global_step})"
+                    )
+                }
+            )
+
         # record forward and reverse KL between student and teacher (full-vocab)
         teacher_log_probs = nn.functional.log_softmax(teacher_logits, dim=-1)
 
