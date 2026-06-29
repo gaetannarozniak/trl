@@ -87,6 +87,8 @@ class FDConfig(_BaseConfig):
             Temperature applied to the in-process teacher, both for the distillation forward and for teacher
             generation when `eval_teacher` is enabled. When `None`, the student's `temperature` is used. Not supported
             with `use_teacher_server` or `use_liger_kernel`.
+        penalize_frequent_tokens (`bool`, *optional*, defaults to False):
+            Whether to substract the running mean of logits to the teacher's logits.
 
         > Parameters that control reprompting
 
@@ -558,6 +560,10 @@ class FDConfig(_BaseConfig):
     teacher_temperature: float | None = field(
         default=None,
         metadata={"help": "The teacher temperature, if different from the student's temperature."},
+    )
+    penalize_frequent_tokens: bool = field(
+        default=False,
+        metadata={"help": "Whether to substract the running mean of logits to the teacher's logits."},
     )
     max_reprompt_len: int = field(
         default=10240,

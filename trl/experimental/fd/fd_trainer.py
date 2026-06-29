@@ -438,6 +438,8 @@ class FDTrainer(_BaseTrainer):
         self.mask_truncated_completions = args.mask_truncated_completions
         self.temperature = args.temperature
         self.teacher_temperature = args.temperature if args.teacher_temperature is None else args.teacher_temperature
+        self.penalize_frequent_tokens = args.penalize_frequent_tokens
+        self.logits_running_mean = None
         self.use_vllm = args.use_vllm
         self.chat_template_kwargs = args.chat_template_kwargs or {}
         self._step = 0
@@ -548,6 +550,14 @@ class FDTrainer(_BaseTrainer):
         if args.teacher_temperature is not None and (self.use_teacher_server or self.use_liger_loss):
             raise ValueError(
                 "`teacher_temperature` is only supported on the in-process teacher forward, not with "
+                "`use_teacher_server=True` or `use_liger_kernel=True`."
+            )
+
+        # `penalize_frequent_tokens` reshapes the teacher logits in the in-process forward only; the server and Liger
+        # paths never see the adjustment, so an explicit request would be silently ignored there.
+        if args.penalize_frequent_tokens and (self.use_teacher_server or self.use_liger_loss):
+            raise ValueError(
+                "`penalize_frequent_tokens` is only supported on the in-process teacher forward, not with "
                 "`use_teacher_server=True` or `use_liger_kernel=True`."
             )
 
@@ -1521,6 +1531,21 @@ class FDTrainer(_BaseTrainer):
                 logits_to_keep=logits_to_keep,
                 temperature=self.teacher_temperature,
             )
+            if self.penalize_frequent_tokens:
+                # teacher_logits: [batch, sequence, vocab]; logits_running_mean: [vocab]. Update the running mean only
+                # while training, but apply the (frozen) penalty in eval too so the eval teacher matches training.
+                if self.model.training:
+                    # Token-weighted mean over valid completion positions, summed across processes for a global estimate.
+                    masked_sum = (teacher_logits * loss_mask.unsqueeze(-1)).sum(dim=[0, 1])
+                    token_sum = self.accelerator.reduce(masked_sum, reduction="sum")
+                    token_count = self.accelerator.reduce(loss_mask.sum(), reduction="sum")
+                    step_mean = token_sum / token_count.clamp(min=1.0)
+                    if self.logits_running_mean is None:  # only happens for the first step
+                        self.logits_running_mean = step_mean
+                    else:
+                        self.logits_running_mean = 0.95 * self.logits_running_mean + 0.05 * step_mean
+                if self.logits_running_mean is not None:
+                    teacher_logits = teacher_logits - self.logits_running_mean
 
         return DistillationLogits(
             completion_ids=completion_ids,
