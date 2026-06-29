@@ -437,6 +437,7 @@ class FDTrainer(_BaseTrainer):
         self.loss_type = args.loss_type
         self.mask_truncated_completions = args.mask_truncated_completions
         self.temperature = args.temperature
+        self.teacher_temperature = args.temperature if args.teacher_temperature is None else args.teacher_temperature
         self.use_vllm = args.use_vllm
         self.chat_template_kwargs = args.chat_template_kwargs or {}
         self._step = 0
@@ -540,6 +541,15 @@ class FDTrainer(_BaseTrainer):
             )
             self._forward_redirection = _ForwardRedirection()
             self.use_liger_loss = True
+
+        # `teacher_temperature` only flows through the in-process teacher forward (`_forward_logits`). The server
+        # applies temperature on its side and the Liger fused kernel uses the student temperature, so an explicit
+        # value would be silently ignored there.
+        if args.teacher_temperature is not None and (self.use_teacher_server or self.use_liger_loss):
+            raise ValueError(
+                "`teacher_temperature` is only supported on the in-process teacher forward, not with "
+                "`use_teacher_server=True` or `use_liger_kernel=True`."
+            )
 
         super().__init__(
             model=model,
@@ -810,6 +820,7 @@ class FDTrainer(_BaseTrainer):
                 input_ids=teacher_context["teacher_prompt_ids"],
                 attention_mask=teacher_context["teacher_prompt_mask"],
                 generation_config=self.generation_config,
+                temperature=self.teacher_temperature,
             )
         prompt_len = teacher_context["teacher_prompt_ids"].shape[1]
         completion_ids = gen[:, prompt_len:]
@@ -1111,6 +1122,7 @@ class FDTrainer(_BaseTrainer):
                     prompt_completion_ids,
                     attention_mask,
                     logits_to_keep,
+                    self.temperature,
                 )
                 old_per_token_logps = selective_log_softmax(logits, completion_ids)
 
@@ -1181,6 +1193,7 @@ class FDTrainer(_BaseTrainer):
                 input_ids=student_input_ids,
                 attention_mask=student_attention_mask,
                 logits_to_keep=inputs["completion_ids"].size(1),
+                temperature=self.temperature,
             )
             loss = self._compute_policy_loss(inputs, student_logits)
         else:
@@ -1357,6 +1370,7 @@ class FDTrainer(_BaseTrainer):
             input_ids=student_input_ids,
             attention_mask=student_attention_mask,
             logits_to_keep=logits_to_keep,
+            temperature=self.temperature,
         )
 
         mode = "train" if model.training else "eval"
@@ -1496,6 +1510,7 @@ class FDTrainer(_BaseTrainer):
             input_ids=student_input_ids,
             attention_mask=student_attention_mask,
             logits_to_keep=logits_to_keep,
+            temperature=self.temperature,
         )
 
         with torch.no_grad(), self._get_teacher_context_for_self_distillation():
@@ -1504,6 +1519,7 @@ class FDTrainer(_BaseTrainer):
                 input_ids=inputs["teacher_input_ids"],
                 attention_mask=inputs["teacher_attention_mask"],
                 logits_to_keep=logits_to_keep,
+                temperature=self.teacher_temperature,
             )
 
         return DistillationLogits(
@@ -1520,6 +1536,7 @@ class FDTrainer(_BaseTrainer):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         logits_to_keep: int,
+        temperature: float,
     ) -> torch.Tensor:
         """Forward the model and return temperature-scaled logits aligned to the completion tokens."""
         model_inputs = {
@@ -1533,7 +1550,7 @@ class FDTrainer(_BaseTrainer):
         logits = model(**model_inputs).logits
         logits = logits[:, :-1, :]
         logits = logits[:, -logits_to_keep:, :]
-        return logits / self.temperature
+        return logits / temperature
 
     def _compute_liger_loss(self, model, inputs: TrainingBatch) -> torch.Tensor:
         """`full_logits` distillation via the Liger fused JSD kernel: forwards the base models for hidden states and

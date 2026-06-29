@@ -83,6 +83,10 @@ class FDConfig(_BaseConfig):
             Teacher update rate used for EMA teacher synchronization.
         teacher_sync_steps (`int`, *optional*, defaults to `1`):
             How often to synchronize the EMA teacher model.
+        teacher_temperature (`float`, *optional*):
+            Temperature applied to the in-process teacher, both for the distillation forward and for teacher
+            generation when `eval_teacher` is enabled. When `None`, the student's `temperature` is used. Not supported
+            with `use_teacher_server` or `use_liger_kernel`.
 
         > Parameters that control reprompting
 
@@ -550,6 +554,10 @@ class FDConfig(_BaseConfig):
     teacher_sync_steps: int = field(
         default=1,
         metadata={"help": "How often to synchronize the EMA teacher model."},
+    )
+    teacher_temperature: float | None = field(
+        default=None,
+        metadata={"help": "The teacher temperature, if different from the student's temperature."},
     )
     max_reprompt_len: int = field(
         default=10240,
