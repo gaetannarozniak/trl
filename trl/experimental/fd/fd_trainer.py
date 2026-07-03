@@ -561,6 +561,14 @@ class FDTrainer(_BaseTrainer):
                 "`use_teacher_server=True` or `use_liger_kernel=True`."
             )
 
+        # KL regularization needs a frozen-reference forward and the student's full-vocab logps; the server path only
+        # returns teacher top-k logprobs and the Liger fused path returns a scalar, so neither can carry the KL term.
+        if args.beta != 0.0 and (self.use_teacher_server or self.use_liger_loss):
+            raise ValueError(
+                "KL regularization (`beta` != 0) is only supported on the in-process teacher forward, not with "
+                "`use_teacher_server=True` or `use_liger_kernel=True`."
+            )
+
         super().__init__(
             model=model,
             args=args,
@@ -630,6 +638,29 @@ class FDTrainer(_BaseTrainer):
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high
         self.beta = args.beta
+
+        # Reference model for KL regularization, mirroring GRPOTrainer. Built from the model path like the teacher
+        # (a deepcopy would clone empty shards under ZeRO-3). For PEFT no separate model is kept: the adapter is
+        # disabled at ref-logp time to recover the base model. Skipped entirely when `beta == 0.0`.
+        if self.beta == 0.0:
+            self.ref_model = None
+        elif is_peft_model(self.model):
+            self.ref_model = None
+        else:
+            model_init_kwargs = self.args.model_init_kwargs or {}
+            if self.args.distributed_state.distributed_type in ["MULTI_GPU", "DEEPSPEED"]:
+                model_init_kwargs["device_map"] = None
+            self.ref_model = create_model_from_path(get_config_model_id(self.model.config), **model_init_kwargs)
+            self.ref_model.requires_grad_(False)
+            self.ref_model.eval()
+            if args.disable_dropout:
+                disable_dropout_in_model(self.ref_model)
+            if self.is_deepspeed_enabled:
+                self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+            elif self.is_fsdp_enabled:
+                self.ref_model = prepare_fsdp(self.ref_model, self.accelerator)
+            else:
+                self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
 
         if not isinstance(reward_funcs, list):
             reward_funcs = [reward_funcs]
@@ -1016,6 +1047,12 @@ class FDTrainer(_BaseTrainer):
             completion_ids=completion_ids,
             completion_mask=completion_mask,
         )
+        ref_per_token_logps = self._compute_ref_logps(
+            prompt_ids=prompt_ids,
+            prompt_mask=prompt_mask,
+            completion_ids=completion_ids,
+            completion_mask=completion_mask,
+        )
         batch: TrainingBatch = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -1027,6 +1064,8 @@ class FDTrainer(_BaseTrainer):
         }
         if old_per_token_logps is not None:
             batch["old_per_token_logps"] = old_per_token_logps
+        if ref_per_token_logps is not None:
+            batch["ref_per_token_logps"] = ref_per_token_logps
         return batch
 
     def _get_completion_ids_list(self, batch: TrainingBatch) -> list[list[int]]:
@@ -1138,6 +1177,39 @@ class FDTrainer(_BaseTrainer):
 
         return old_per_token_logps
 
+    def _compute_ref_logps(
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        completion_ids: torch.Tensor,
+        completion_mask: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Frozen-reference per-token logps over the completion, for KL regularization (mirrors GRPOTrainer).
+
+        Computed once at rollout time (the reference is frozen, so the values are reused across the buffered
+        optimization steps) and temperature-scaled like the student logps so the KL is taken in the same space.
+        Returns `None` when `beta == 0.0`. For PEFT the adapter is disabled to recover the base model.
+        """
+        if self.beta == 0.0:
+            return None
+        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+        with torch.no_grad():
+            if self.ref_model is not None:
+                logits = self._forward_logits(
+                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep, self.temperature
+                )
+            else:
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                ref_adapter = "ref" if "ref" in unwrapped_model.peft_config else None
+                with use_adapter(unwrapped_model, adapter_name=ref_adapter):
+                    logits = self._forward_logits(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, self.temperature
+                    )
+            ref_per_token_logps = selective_log_softmax(logits, completion_ids)
+        return ref_per_token_logps
+
     def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
         device = self.accelerator.device
         if len(self.reward_funcs) == 0:
@@ -1195,6 +1267,8 @@ class FDTrainer(_BaseTrainer):
             else:
                 distillation_logits = self._compute_teacher_student_logits(model, self.teacher_model, inputs)
                 loss = self._compute_self_distillation_loss(model, inputs, distillation_logits)
+                if self.beta != 0.0:
+                    loss = loss + self.beta * self._compute_kl_loss(distillation_logits.student_logits, inputs)
         elif self.args.distillation_weight == 0.0:
             student_input_ids = torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1)
             student_attention_mask = torch.cat([inputs["prompt_mask"], inputs["completion_mask"]], dim=1)
@@ -1206,6 +1280,8 @@ class FDTrainer(_BaseTrainer):
                 temperature=self.temperature,
             )
             loss = self._compute_policy_loss(inputs, student_logits)
+            if self.beta != 0.0:
+                loss = loss + self.beta * self._compute_kl_loss(student_logits, inputs)
         else:
             distillation_logits = self._compute_teacher_student_logits(model, self.teacher_model, inputs)
             policy_loss = self._compute_policy_loss(inputs, distillation_logits.student_logits)
@@ -1213,6 +1289,8 @@ class FDTrainer(_BaseTrainer):
             loss = (
                 1 - self.args.distillation_weight
             ) * policy_loss + self.args.distillation_weight * distillation_loss
+            if self.beta != 0.0:
+                loss = loss + self.beta * self._compute_kl_loss(distillation_logits.student_logits, inputs)
 
         accumulation_scale = self.current_gradient_accumulation_steps if self.model.training else 1.0
         return loss / accumulation_scale
@@ -1257,6 +1335,40 @@ class FDTrainer(_BaseTrainer):
         )
 
         return loss
+
+    def _compute_kl_loss(self, student_logits, inputs: TrainingBatch) -> torch.Tensor:
+        """KL(student || reference) regularization, following GRPOTrainer's k3 estimator.
+
+        Taken over the completion tokens (`completion_mask`, independent of the distillation mask) so it anchors the
+        whole policy toward the frozen reference, and reduced with the same `loss_type` normalizer as
+        `_compute_policy_loss`. Because that reduction is linear, adding `beta * kl` to the total loss is equivalent
+        to GRPO's per-token `per_token_loss + beta * per_token_kl`.
+        """
+        completion_ids = inputs["completion_ids"]
+        completion_mask = inputs["completion_mask"]
+        per_token_logps = selective_log_softmax(student_logits, completion_ids)
+        ref_per_token_logps = inputs["ref_per_token_logps"]
+        per_token_kl = (
+            torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+        )
+
+        if self.loss_type == "grpo":
+            kl = (per_token_kl * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+            kl = kl.mean()
+        elif self.loss_type == "bnpo":
+            kl = (per_token_kl * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+        elif self.loss_type == "dr_grpo":
+            kl = (per_token_kl * completion_mask).sum() / (per_token_kl.size(0) * self.max_completion_length)
+        elif self.loss_type == "dapo":
+            kl = (per_token_kl * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+        else:
+            raise ValueError(f"Unsupported loss_type: {self.loss_type}")
+
+        mode = "train" if self.model.training else "eval"
+        mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+        self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl.detach()).nanmean().item())
+
+        return kl
 
     def _compute_self_distillation_loss(
         self,
