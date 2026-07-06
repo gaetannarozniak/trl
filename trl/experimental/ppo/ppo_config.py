@@ -111,6 +111,10 @@ class PPOConfig(_BaseConfig):
             Whether to freeze the policy and update only the value function. When `True`, the policy loss is excluded
             from the total loss, so only the value head receives gradients. Useful for warming up the value function
             before policy optimization.
+        eval_value_function_freq (`int`, *optional*, defaults to `0`):
+            Step frequency at which to run a dedicated value-function evaluation: generate a few fixed eval
+            trajectories and log per-token value diagnostics (an interactive value-vs-position plot and a per-token
+            heatmap table) to wandb. Disabled when `0`.
         ds3_gather_for_generation (`bool`, *optional*, defaults to `True`):
             This setting applies to DeepSpeed ZeRO-3. If enabled, the policy model weights are gathered for generation,
             improving generation speed. However, disabling this option allows training models that exceed the VRAM
@@ -279,6 +283,13 @@ class PPOConfig(_BaseConfig):
         metadata={
             "help": "Whether to freeze the policy and update only the value function. When `True`, the policy loss is "
             "excluded from the total loss, so only the value head receives gradients."
+        },
+    )
+    eval_value_function_freq: int = field(
+        default=0,
+        metadata={
+            "help": "Step frequency at which to run a dedicated value-function evaluation (generate a few fixed eval "
+            "trajectories and log per-token value diagnostics to wandb). Disabled when `0`."
         },
     )
     ds3_gather_for_generation: bool = field(

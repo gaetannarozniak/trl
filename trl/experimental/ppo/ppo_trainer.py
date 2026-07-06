@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import html
 import math
 import os
 import textwrap
@@ -21,6 +22,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -660,6 +662,206 @@ class PPOTrainer(_BaseTrainer):
             logger.warning(f"Failed to log value trajectories to wandb: {e}")
         plt.close(fig)
 
+    def _eval_value_function(self, n_prompts: int = 4, n_completions: int = 32) -> None:
+        """Evaluate the value head on a few fixed eval prompts and log rich per-token diagnostics to wandb.
+
+        Samples `n_completions` trajectories for each of the first `n_prompts` eval prompts with the current policy
+        (using the training generation settings), scores the value head at every completion token, then logs, **one
+        interactive plot per prompt**, the per-trajectory value-vs-position curves (colored green=success/red=failure,
+        trajectory index + token shown on hover) with a green/red marker where each trajectory terminates. Also logs a
+        `wandb.Table` with one HTML heatmap per trajectory (token background = predicted value, exact value on hover).
+        Self-contained so the train loop only gains a one-line guard.
+        """
+        if self.eval_dataset is None:
+            return
+        args = self.args
+        processing_class = self.processing_class
+        device = self.accelerator.device
+        bs = args.local_rollout_forward_batch_size
+
+        # Fixed set of prompts, each repeated `n_completions` times so we get `n_prompts * n_completions` trajectories.
+        features = [self.eval_dataset[i] for i in range(n_prompts)]
+        batch = self.data_collator(features)
+        queries = batch["input_ids"].repeat_interleave(n_completions, dim=0).to(device)
+        data = {
+            key: value.repeat_interleave(n_completions, dim=0)
+            if torch.is_tensor(value)
+            else [item for item in value for _ in range(n_completions)]
+            for key, value in batch.items()
+        }
+        prompt_idxs = [p for p in range(n_prompts) for _ in range(n_completions)]
+
+        # Use the same generation settings as training (sampled, so the `n_completions` completions differ).
+        generation_kwargs = {
+            "max_new_tokens": args.response_length,
+            "temperature": (args.temperature + 1e-7),
+            "top_k": 0.0,
+            "top_p": 1.0,
+            "do_sample": True,
+        }
+        generation_config = GenerationConfig(**generation_kwargs)
+
+        with torch.no_grad():
+            context_length = queries.shape[1]
+            with unwrap_model_for_generation(
+                self.model,
+                self.accelerator,
+                gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+                generation_kwargs=generation_kwargs,  # Override model.generation_config with generation_kwargs to fix transformers#42762
+            ) as unwrapped_model:
+                query_responses, _ = batch_generation(
+                    unwrapped_model.policy,
+                    queries,
+                    bs,
+                    processing_class.pad_token_id,
+                    generation_config,
+                )
+            response = query_responses[:, context_length:]
+            postprocessed_response = response
+            if self.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
+                postprocessed_response = truncate_response(
+                    self.stop_token_id, processing_class.pad_token_id, response
+                )
+            sequence_lengths = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
+
+            # Chunk the value/score forward passes: with many completions, one forward over all sequences (fp32 value
+            # model, all hidden states materialized) would OOM. Mirrors the training rollout's chunking.
+            unwrapped_value_model = self.accelerator.unwrap_model(self.model).value_model
+            values, scores = [], []
+            for j in range(0, queries.shape[0], bs):
+                chunk = slice(j, j + bs)
+                # Inference only, so run the (fp32) value model under bf16 autocast: faster and roughly halves the
+                # hidden-state memory. The fp32 weights are untouched — the NaN risk is a training-only concern.
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    full_value, _, _ = get_reward(
+                        unwrapped_value_model, query_responses[chunk], processing_class.pad_token_id, context_length
+                    )
+                values.append(full_value[:, context_length - 1 : -1].squeeze(-1))
+                postprocessed_query_response = torch.cat((queries[chunk], postprocessed_response[chunk]), 1)
+                scores.append(
+                    self._compute_rollout_scores(
+                        self.reward_model, postprocessed_query_response, postprocessed_response[chunk],
+                        context_length, data, chunk,
+                    )
+                )
+            values = torch.cat(values, 0)
+            scores = torch.cat(scores, 0)
+
+        # Only the main process builds and logs the artifacts; the trajectories from this rank are enough.
+        if not self.accelerator.is_main_process or "wandb" not in (self.args.report_to or []):
+            return
+        import wandb
+
+        if wandb.run is None:
+            return
+        try:
+            import plotly.graph_objects as go
+        except ImportError:
+            logger.warning("plotly not available; skipping value-function evaluation plot.")
+            return
+
+        decode = partial(processing_class.decode, skip_special_tokens=False)
+        values = values.float().cpu()
+        scores = scores.float().cpu()
+        sequence_lengths = sequence_lengths.cpu()
+        postprocessed_response = postprocessed_response.cpu()
+        prompt_texts = processing_class.batch_decode(queries[:, :context_length], skip_special_tokens=True)
+
+        figs = {}  # one figure per prompt index
+        table = wandb.Table(columns=["idx", "prompt_idx", "success", "mean_value", "trajectory"])
+        for idx in range(values.shape[0]):
+            length = int(sequence_lengths[idx])
+            end = min(length + 1, values.shape[1])
+            traj = values[idx, :end].tolist()
+            success = bool(scores[idx] > 0.5)
+            p = prompt_idxs[idx]
+            color = "green" if success else "red"
+            label = f"traj {idx} | {'success' if success else 'fail'}"
+
+            token_ids = postprocessed_response[idx, :end].tolist()
+            token_strs = [decode([tok_id]) for tok_id in token_ids]
+            # `value[k]` is V of the state right before completion token `k` is emitted; show that token on hover.
+            hover_tokens = [tok.replace("\n", "\\n").replace("\t", "\\t") for tok in token_strs]
+
+            fig = figs.setdefault(p, go.Figure())
+            fig.add_trace(
+                go.Scatter(
+                    x=list(range(end)),
+                    y=traj,
+                    customdata=hover_tokens,
+                    mode="lines",
+                    name=label,
+                    line={"color": color, "width": 1},
+                    opacity=0.2,
+                    showlegend=False,
+                    hovertemplate=f"{label}<br>pos %{{x}}<br>token %{{customdata}}<br>value %{{y:.3f}}<extra></extra>",
+                )
+            )
+            # Marker where the trajectory terminates: green if the completion is correct, red otherwise.
+            fig.add_trace(
+                go.Scatter(
+                    x=[end - 1],
+                    y=[traj[-1] if traj else 0.0],
+                    mode="markers",
+                    marker={"color": color, "size": 6, "line": {"width": 0.5, "color": "black"}},
+                    opacity=0.6,
+                    showlegend=False,
+                    hovertemplate=f"{label} (end)<br>pos %{{x}}<br>value %{{y:.3f}}<extra></extra>",
+                )
+            )
+
+            mean_value = sum(traj) / len(traj) if traj else 0.0
+            html_block = self._build_value_html(prompt_texts[idx], token_strs, traj)
+            table.add_data(idx, p, success, mean_value, wandb.Html(html_block))
+
+        log_dict = {}
+        for p, fig in figs.items():
+            fig.update_layout(
+                title=f"Value vs sequence position — prompt {p} (step {self.state.global_step}) — "
+                "green=success, red=failure",
+                xaxis_title="sequence position",
+                yaxis_title="value",
+            )
+            log_dict[f"value_fn/eval_value_vs_position/prompt_{p}"] = fig
+        # Namespace the table by step: a `wandb.Table` holding media (`wandb.Html`) logged to a *fixed* key across
+        # steps renders with empty media cells; a per-step key uploads the HTML correctly.
+        log_dict[f"value_fn/eval_trajectories/{self.state.global_step:05d}"] = table
+        try:
+            wandb.log(log_dict)
+        except Exception as e:
+            logger.warning(f"Failed to log value-function evaluation to wandb: {e}")
+
+    @staticmethod
+    def _build_value_html(prompt_text: str, token_strs: list[str], token_values: list[float]) -> str:
+        """Render one trajectory as HTML: the prompt plus a completion heatmap colored by the value head.
+
+        Each completion token's background interpolates red (value 0) → green (value 1); the exact value appears on
+        hover. Values are assumed to live roughly in `[0, 1]` (expected success probability) and are clamped.
+        """
+
+        def escape(text: str) -> str:
+            return html.escape(text).replace(" ", "&middot;").replace("\n", "&#9166;<br>")
+
+        spans = []
+        for tok, v in zip(token_strs, token_values):
+            v_clipped = max(0.0, min(1.0, v))
+            r, g = int(255 * (1 - v_clipped)), int(255 * v_clipped)
+            spans.append(
+                f'<span style="background-color:rgba({r}, {g}, 80, 0.6); padding:1px 2px; '
+                f'border-radius:2px;" title="value={v:.3f}">{escape(tok)}</span>'
+            )
+
+        def section(label: str, content: str, bg: str, border: str) -> str:
+            style = f"background:{bg}; border-left:4px solid {border}; padding:8px; margin:6px 0; white-space:pre-wrap;"
+            return f'<div style="{style}"><b>{label}</b><br>{content}</div>'
+
+        return (
+            '<div style="font-family:monospace; line-height:1.6;">'
+            + section("Prompt", escape(prompt_text), "#f0f0f0", "#888")
+            + section("Completion (heatmap: red=low value, green=high value)", "".join(spans), "#fafafa", "#5587c4")
+            + "</div>"
+        )
+
     @contextmanager
     def null_ref_context(self):
         """Context manager for handling null reference model (that is, peft adapter manipulation)."""
@@ -1013,6 +1215,9 @@ class PPOTrainer(_BaseTrainer):
 
             if args.num_sample_generations > 0 and (update - 1) % self.sample_generations_freq == 0:
                 self.generate_completions(sampling=True)
+                empty_cache()
+            if args.eval_value_function_freq and (update - 1) % args.eval_value_function_freq == 0:
+                self._eval_value_function()
                 empty_cache()
             del (
                 query_responses,

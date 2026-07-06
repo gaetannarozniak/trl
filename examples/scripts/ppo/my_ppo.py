@@ -109,6 +109,7 @@ training_args = PPOConfig(
     temperature=1.0,
     stop_token="eos",
     report_to="wandb",
+    eval_value_function_freq=25,
 )
 
 trainer = PPOTrainer(
