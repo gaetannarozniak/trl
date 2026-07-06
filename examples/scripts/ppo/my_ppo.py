@@ -10,6 +10,7 @@ compared to the gold solution. It is plugged in through `PPOTrainer(reward_fn=..
 """
 
 import re
+import os
 
 import torch
 from datasets import load_dataset
@@ -24,6 +25,9 @@ SYSTEM_PROMPT = (
     "A conversation between user and assistant. The user asks a question, and the assistant briefly solves it. "
     "The final answer (only a number) must be on its own line in the format\n`#### <answer>`."
 )
+
+os.environ["WANDB_PROJECT"] = "value_function"
+
 
 
 # --- GSM8K helpers (mirrors trl/experimental/sdpo/sdpo.py) ---------------------------------------------------------
