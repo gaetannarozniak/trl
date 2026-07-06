@@ -1915,6 +1915,17 @@ class FDTrainer(_BaseTrainer):
         agg_per_seq_rev_kl = self.accelerator.gather(per_seq_rev_kl)
         self._metrics[mode]["distribution/kl_student_to_teacher"].append(agg_per_seq_rev_kl.mean().item())
 
+        # marginal KL(teacher || student): KL between the global marginal (position-averaged, masked) vocab
+        # distributions, i.e. how differently teacher and student use the vocabulary on aggregate.
+        teacher_masked_prob_sum = (teacher_log_probs.exp() * loss_mask.unsqueeze(-1)).sum(dim=[0, 1])  # [vocab_size]
+        teacher_masked_prob_sum = self.accelerator.gather(teacher_masked_prob_sum.unsqueeze(0)).sum(0)
+        teacher_marginal_prob = teacher_masked_prob_sum / token_count.clamp(min=1.0)
+        marginal_kl = (
+            teacher_marginal_prob
+            * (teacher_marginal_prob.clamp(min=1e-12).log() - marginal_prob.clamp(min=1e-12).log())
+        ).sum()
+        self._metrics[mode]["distribution/marginal_kl_teacher_to_student"].append(marginal_kl.item())
+
     def _log_self_distillation_metric(self, mode: str, value: float) -> None:
         metric_prefix = self._name.lower().replace(" ", "_")
         self._metrics[mode]["self_distillation/distillation_loss"].append(value)
