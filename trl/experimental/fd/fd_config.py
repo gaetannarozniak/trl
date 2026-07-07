@@ -113,6 +113,21 @@ class FDConfig(_BaseConfig):
         remove_thinking_from_demonstration (`bool`, *optional*, defaults to `False`):
             Whether to remove <think>...</think> blocks from the demonstration text.
 
+        > Parameters that control multi-feedback aggregation
+
+        aggregate_feedbacks (`bool`, *optional*, defaults to `False`):
+            Score the teacher under several equivalent-meaning but differently-phrased feedbacks and distill toward
+            their consensus instead of a single teacher distribution. Each variant feedback is obtained by applying a
+            `feedback_variant_templates` entry to the sample's feedback, and the teacher context is rebuilt normally
+            (roles and `reprompt_template` preserved). Only tokens on which all variants agree in direction (relative
+            to the student) are kept, at the most conservative magnitude, so form-specific effects cancel out. With a
+            single identity template `"{feedback}"` this reduces exactly to the standard single-feedback teacher. Not
+            supported with `use_teacher_server` or `penalize_frequent_tokens`.
+        feedback_variant_templates (`list[str]`, *optional*):
+            List of at least two feedback phrasings, one per variant. If an entry contains a `{feedback}` placeholder
+            it is substituted with the sample's dataset feedback (so `"{feedback}"` reproduces the standard single
+            feedback); otherwise the entry is used verbatim as the feedback. Required when `aggregate_feedbacks=True`.
+
         > Parameters that control diagnostics
 
         diagnostics_warning_interval (`int`, *optional*, defaults to `10`):
@@ -565,6 +580,21 @@ class FDConfig(_BaseConfig):
         default=False,
         metadata={"help": "Whether to substract the running mean of logits to the teacher's logits."},
     )
+    aggregate_feedbacks: bool = field(
+        default=False,
+        metadata={
+            "help": "Score the teacher under several equivalent-meaning but differently-phrased feedback contexts and "
+            "distill toward their consensus. Not supported with `use_teacher_server` or `penalize_frequent_tokens`."
+        },
+    )
+    feedback_variant_templates: list[str] | None = field(
+        default=None,
+        metadata={
+            "help": "At least two feedback phrasings, one per variant. An entry containing a `{feedback}` placeholder "
+            "is substituted with the sample's dataset feedback (`\"{feedback}\"` reproduces the standard single "
+            "feedback); otherwise it is used verbatim. Required when `aggregate_feedbacks=True`."
+        },
+    )
     max_reprompt_len: int = field(
         default=10240,
         metadata={"help": "Maximum length for reprompting in self-distillation."},
@@ -670,3 +700,25 @@ class FDConfig(_BaseConfig):
 
         if self.epsilon_high is None:
             self.epsilon_high = self.epsilon
+
+        if self.aggregate_feedbacks:
+            if self.use_teacher_server:
+                raise ValueError(
+                    "`aggregate_feedbacks` is not supported with `use_teacher_server`: the server scores a single "
+                    "context and cannot return per-variant teacher logits."
+                )
+            if self.use_liger_kernel:
+                raise ValueError(
+                    "`aggregate_feedbacks` is not supported with `use_liger_kernel`: the fused liger path bypasses "
+                    "the teacher-consensus computation."
+                )
+            if self.penalize_frequent_tokens:
+                raise ValueError(
+                    "`aggregate_feedbacks` is not supported together with `penalize_frequent_tokens`; the consensus "
+                    "already suppresses form-specific token mass."
+                )
+            if not self.feedback_variant_templates or len(self.feedback_variant_templates) < 2:
+                raise ValueError(
+                    "`aggregate_feedbacks=True` requires at least two `feedback_variant_templates`, got "
+                    f"{self.feedback_variant_templates}."
+                )

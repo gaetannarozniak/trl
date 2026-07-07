@@ -969,12 +969,15 @@ class FDTrainer(_BaseTrainer):
 
         batch["rewards"] = local_rewards
         batch["advantages"] = local_advantages
-        teacher_context = self.teacher_context_builder.build(
-            batch,
-            prompts,
-            batch["rewards"],
-            feedbacks=privileged_contexts,
-        )
+        if self.args.aggregate_feedbacks:
+            teacher_context = self._build_aggregated_teacher_context(batch, prompts, privileged_contexts)
+        else:
+            teacher_context = self.teacher_context_builder.build(
+                batch,
+                prompts,
+                batch["rewards"],
+                feedbacks=privileged_contexts,
+            )
 
         if mode == "eval" and self.args.eval_teacher:
             self._eval_teacher(teacher_context, prompts, inputs)
@@ -1011,6 +1014,56 @@ class FDTrainer(_BaseTrainer):
             self_distillation_mask=batch.get("self_distillation_mask"),
         )
         return batch
+
+    def _build_aggregated_teacher_context(self, batch, prompts, privileged_contexts) -> dict[str, torch.Tensor]:
+        """Build one teacher context per feedback variant and stack them into `batch` (see `aggregate_feedbacks`).
+
+        Each `feedback_variant_templates` entry yields an equivalent-meaning feedback (a `{feedback}` placeholder is
+        substituted with the sample's dataset feedback, otherwise the entry is used verbatim). The variants share the
+        prompt/demonstration/roles, so the first is returned as the canonical teacher context (used for metrics,
+        logging and the single-teacher batch keys), while the left-padded stack of all variants is added under
+        `teacher_input_ids_variants` / `teacher_attention_mask_variants` for `_aggregated_teacher_logits`.
+        """
+        variant_contexts = [
+            self.teacher_context_builder.build(
+                batch,
+                prompts,
+                batch["rewards"],
+                feedbacks=[
+                    (template.format(feedback=feedback) if "{feedback}" in template else template)
+                    if isinstance(feedback, str)
+                    else feedback
+                    for feedback in privileged_contexts
+                ],
+            )
+            for template in self.args.feedback_variant_templates
+        ]
+        # Left-pad each variant's teacher inputs to a common length and stack: [batch, num_variants, sequence]. Kept as
+        # a single tensor (batch on dim 0) so `split_tensor_dict` slices it like every other batch field.
+        max_len = max(context["teacher_input_ids"].size(1) for context in variant_contexts)
+        batch["teacher_input_ids_variants"] = torch.stack(
+            [
+                nn.functional.pad(
+                    context["teacher_input_ids"],
+                    (max_len - context["teacher_input_ids"].size(1), 0),
+                    value=self._tokenizer.pad_token_id,
+                )
+                for context in variant_contexts
+            ],
+            dim=1,
+        )
+        batch["teacher_attention_mask_variants"] = torch.stack(
+            [
+                nn.functional.pad(
+                    context["teacher_attention_mask"],
+                    (max_len - context["teacher_attention_mask"].size(1), 0),
+                    value=0,
+                )
+                for context in variant_contexts
+            ],
+            dim=1,
+        )
+        return variant_contexts[0]
 
     def sample_rollouts(self, inputs: list[dict[str, Any]]) -> TrainingBatch:
         """Generate completions for a batch of prompts and assemble the training batch."""
@@ -1635,6 +1688,19 @@ class FDTrainer(_BaseTrainer):
             temperature=self.temperature,
         )
 
+        if self.args.aggregate_feedbacks:
+            # Distill toward the consensus of several equivalent-meaning feedback contexts instead of a single teacher.
+            # Returns a drop-in `[batch, sequence, vocab]` logits tensor, so everything downstream is unchanged.
+            teacher_logits = self._aggregated_teacher_logits(teacher_model, inputs, student_logits, logits_to_keep)
+
+            return DistillationLogits(
+                completion_ids=completion_ids,
+                completion_mask=completion_mask,
+                loss_mask=loss_mask,
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+            )
+
         with torch.no_grad(), self._get_teacher_context_for_self_distillation():
             teacher_logits = self._forward_logits(
                 model=teacher_model,
@@ -1666,6 +1732,40 @@ class FDTrainer(_BaseTrainer):
             student_logits=student_logits,
             teacher_logits=teacher_logits,
         )
+
+    def _aggregated_teacher_logits(self, teacher_model, inputs, student_logits, logits_to_keep) -> torch.Tensor:
+        """Consensus teacher logits over the pre-built feedback variants (see `aggregate_feedbacks`).
+
+        The variant teacher contexts were built in `_prepare_training_batch` (same prompt/demonstration, differently-
+        phrased feedback) and stacked into `teacher_input_ids_variants`. Each is scored by the teacher over the shared
+        completion, then combined in student-relative log-ratio space: for every token we keep only the shift on which
+        *all* variants agree in direction, at the smallest (most conservative) magnitude — opposite-sign tokens cancel
+        to zero, so form-specific effects present in only some variants are removed. Returns log-prob-space logits
+        `s + consensus` shaped like a normal teacher output, so the loss/metrics are unchanged; with a single identity
+        feedback template this equals the standard single-teacher target exactly.
+        """
+        variant_input_ids = inputs["teacher_input_ids_variants"]  # [batch, num_variants, sequence]
+        variant_attention_mask = inputs["teacher_attention_mask_variants"]
+        # Student log-probs are the common reference; detach so the aggregated target carries no gradient.
+        student_log_probs = student_logits.detach().log_softmax(dim=-1)
+
+        deltas = []
+        with torch.no_grad(), self._get_teacher_context_for_self_distillation():
+            for variant in range(variant_input_ids.size(1)):
+                variant_logits = self._forward_logits(
+                    model=teacher_model,
+                    input_ids=variant_input_ids[:, variant],
+                    attention_mask=variant_attention_mask[:, variant],
+                    logits_to_keep=logits_to_keep,
+                    temperature=self.teacher_temperature,
+                )
+                deltas.append(variant_logits.log_softmax(dim=-1) - student_log_probs)
+
+        # Hard consensus: `relu(δ).amin` is the smallest up-shift only if every variant upweights the token (else 0);
+        # symmetrically for down-shifts. A token cannot be unanimously up and down, so at most one term is non-zero.
+        deltas = torch.stack(deltas, dim=0)  # [num_variants, batch, sequence, vocab]
+        consensus = torch.relu(deltas).amin(dim=0) - torch.relu(-deltas).amin(dim=0)
+        return student_log_probs + consensus
 
     def _forward_logits(
         self,
