@@ -1691,7 +1691,7 @@ class FDTrainer(_BaseTrainer):
         if self.args.aggregate_feedbacks:
             # Distill toward the consensus of several equivalent-meaning feedback contexts instead of a single teacher.
             # Returns a drop-in `[batch, sequence, vocab]` logits tensor, so everything downstream is unchanged.
-            teacher_logits = self._aggregated_teacher_logits(teacher_model, inputs, student_logits, logits_to_keep)
+            teacher_logits = self._aggregated_teacher_logits(teacher_model, inputs, student_logits, logits_to_keep, loss_mask)
 
             return DistillationLogits(
                 completion_ids=completion_ids,
@@ -1733,7 +1733,7 @@ class FDTrainer(_BaseTrainer):
             teacher_logits=teacher_logits,
         )
 
-    def _aggregated_teacher_logits(self, teacher_model, inputs, student_logits, logits_to_keep) -> torch.Tensor:
+    def _aggregated_teacher_logits(self, teacher_model, inputs, student_logits, logits_to_keep, loss_mask) -> torch.Tensor:
         """Consensus teacher logits over the pre-built feedback variants (see `aggregate_feedbacks`).
 
         The variant teacher contexts were built in `_prepare_training_batch` (same prompt/demonstration, differently-
@@ -1750,6 +1750,7 @@ class FDTrainer(_BaseTrainer):
         student_log_probs = student_logits.detach().log_softmax(dim=-1)
 
         deltas = []
+        variant_log_probs = []
         with torch.no_grad(), self._get_teacher_context_for_self_distillation():
             for variant in range(variant_input_ids.size(1)):
                 variant_logits = self._forward_logits(
@@ -1759,13 +1760,76 @@ class FDTrainer(_BaseTrainer):
                     logits_to_keep=logits_to_keep,
                     temperature=self.teacher_temperature,
                 )
-                deltas.append(variant_logits.log_softmax(dim=-1) - student_log_probs)
+                log_probs = variant_logits.log_softmax(dim=-1)
+                variant_log_probs.append(log_probs)
+                deltas.append(log_probs - student_log_probs)
 
         # Hard consensus: `relu(δ).amin` is the smallest up-shift only if every variant upweights the token (else 0);
         # symmetrically for down-shifts. A token cannot be unanimously up and down, so at most one term is non-zero.
         deltas = torch.stack(deltas, dim=0)  # [num_variants, batch, sequence, vocab]
         consensus = torch.relu(deltas).amin(dim=0) - torch.relu(-deltas).amin(dim=0)
-        return student_log_probs + consensus
+        aggregated_log_probs = student_log_probs + consensus
+        self._record_teacher_variant_entropies(variant_log_probs, aggregated_log_probs, loss_mask)
+        self._log_teacher_variant_distributions(variant_log_probs, aggregated_log_probs, student_log_probs)
+        return aggregated_log_probs
+
+    def _record_teacher_variant_entropies(self, variant_log_probs, aggregated_log_probs, loss_mask) -> None:
+        """Record, under `teacher_variants/`, the mean entropy across the teacher variants and the entropy of the
+        aggregated teacher. Entropies are masked over valid completion tokens and gathered across processes, matching
+        the student-entropy metric in `_record_distribution_metrics`.
+        """
+        mode = "train" if self.model.training else "eval"
+
+        def masked_entropy(log_probs):
+            per_token_entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+            per_seq_entropy = (per_token_entropy * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)
+            return self.accelerator.gather(per_seq_entropy).mean().item()
+
+        teacher_entropies = [masked_entropy(log_probs) for log_probs in variant_log_probs]
+        self._metrics[mode]["teacher_variants/mean_teacher_entropy"].append(sum(teacher_entropies) / len(teacher_entropies))
+        self._metrics[mode]["teacher_variants/aggregated_entropy"].append(masked_entropy(aggregated_log_probs.log_softmax(dim=-1)))
+
+    def _log_teacher_variant_distributions(self, variant_log_probs, aggregated_log_probs, student_log_probs) -> None:
+        """Every 10 steps, log one merged bar chart of the per-token log-prob delta vs the student for each source
+        (each teacher variant and their aggregation), at the first token of the first trajectory. Each source
+        contributes its OWN 10 most-negative and 10 most-positive tokens (its own ordering, so the token sets differ),
+        grouped in the chart by the `"<source> · <rank> <token>"` label. Step-namespaced key so each snapshot persists
+        as its own panel.
+        """
+        if (
+            self.state.global_step % 10 != 0
+            or not self.accelerator.is_main_process
+            or "wandb" not in (self.args.report_to or [])
+            or wandb.run is None
+        ):
+            return
+        # First token of the first trajectory. Teacher variants are already log-softmaxed; the aggregated target is
+        # unnormalized, so log-softmax it into proper log-probs.
+        student = student_log_probs[0, 0]
+        sources = {f"teacher_{i + 1}": log_probs[0, 0] for i, log_probs in enumerate(variant_log_probs)}
+        sources["aggregated"] = aggregated_log_probs[0, 0].log_softmax(dim=-1)
+
+        data = []
+        for name, source_log_probs in sources.items():
+            delta = source_log_probs - student
+            # This source's own 10 most-negative and 10 most-positive tokens, ascending.
+            sorted_ids = delta.sort().indices
+            token_ids = torch.cat([sorted_ids[:10], sorted_ids[-10:]]).tolist()
+            for rank, token_id in enumerate(token_ids):
+                token = self._tokenizer.decode([token_id])
+                data.append([f"{name} · {rank:02d} {token}", delta[token_id].item()])
+        table = wandb.Table(columns=["token", "delta_log_prob"], data=data)
+        try:
+            wandb.log(
+                {
+                    f"teacher_variants/{self.state.global_step}": wandb.plot.bar(
+                        table, "token", "delta_log_prob",
+                        title=f"Teacher/aggregation Δlogp vs student @ first token (step {self.state.global_step})",
+                    )
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to log teacher-variant distributions to wandb: {e}")
 
     def _forward_logits(
         self,
@@ -2025,6 +2089,33 @@ class FDTrainer(_BaseTrainer):
             * (teacher_marginal_prob.clamp(min=1e-12).log() - marginal_prob.clamp(min=1e-12).log())
         ).sum()
         self._metrics[mode]["distribution/marginal_kl_teacher_to_student"].append(marginal_kl.item())
+
+        # logs a table with the tokens whose marginal probability differs most between teacher and student
+        if self.state.global_step % 10 == 0 and self.accelerator.is_main_process and "wandb" in report_to and wandb.run is not None:
+            # Reuse the globally-aggregated marginal distributions (average of per-token probs, normalized) and take
+            # their log, so the delta is log p_teacher(token) - log p_student(token) over proper distributions.
+            delta_log_probs = teacher_marginal_prob.clamp(min=1e-12).log() - marginal_prob.clamp(min=1e-12).log()
+            sorted_delta, indices = delta_log_probs.sort()
+            extreme_deltas = torch.cat([sorted_delta[:10], sorted_delta[-10:]]).tolist()
+            extreme_ids = torch.cat([indices[:10], indices[-10:]]).tolist()
+            extreme_tokens = [f"{rank:02d}: {self._tokenizer.decode([token_id])}" for rank, token_id in enumerate(extreme_ids)]
+            table = wandb.Table(
+                columns=["token", "delta_log_prob"],
+                data=list(zip(extreme_tokens, extreme_deltas)),
+            )
+            # Namespace the key by step (like `_log_trajectories`) so each chart persists as its own panel instead of
+            # the fixed-key custom chart being overwritten every step.
+            try:
+                wandb.log(
+                    {
+                        f"delta_log_probs/{self.state.global_step}": wandb.plot.bar(
+                            table, "token", "delta_log_prob",
+                            title=f"Extreme teacher-student Δ marginal logp (step {self.state.global_step})",
+                        )
+                    }
+                )
+            except Exception as e:
+                logger.warning(f"Failed to log delta_log_probs chart to wandb: {e}")
 
     def _log_self_distillation_metric(self, mode: str, value: float) -> None:
         metric_prefix = self._name.lower().replace(" ", "_")
