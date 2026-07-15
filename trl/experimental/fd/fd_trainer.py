@@ -1423,6 +1423,20 @@ class FDTrainer(_BaseTrainer):
 
         return kl
 
+    def _clip_teacher_logits(self, student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
+        """Clip the teacher within `distillation_clip_teacher` nats of the (detached) student in log-prob space.
+
+        This bounds the per-token teacher/student log-ratio that drives the gradient, taming an over-confident
+        teacher. Log-probs are valid logits (same distribution), so the result drops in for the teacher logits.
+        """
+        student_log_probs = torch.log_softmax(student_logits, dim=-1).detach()
+        teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
+        return student_log_probs + torch.clamp(
+            teacher_log_probs - student_log_probs,
+            min=-self.args.distillation_clip_teacher,
+            max=self.args.distillation_clip_teacher,
+        )
+
     def _compute_self_distillation_loss(
         self,
         model,
@@ -1458,9 +1472,12 @@ class FDTrainer(_BaseTrainer):
                 distillation_add_tail=self.args.distillation_add_tail,
             )
         elif self.args.distillation_mode == "full_logits":
+            teacher_logits = distillation_logits.teacher_logits
+            if self.args.distillation_clip_teacher is not None:
+                teacher_logits = self._clip_teacher_logits(distillation_logits.student_logits, teacher_logits)
             per_token_loss = compute_full_logit_self_distillation_loss(
                 distillation_logits.student_logits,
-                distillation_logits.teacher_logits,
+                teacher_logits,
                 distillation_alpha=self.args.distillation_alpha,
             )
         elif self.args.distillation_mode == "sampled_token":

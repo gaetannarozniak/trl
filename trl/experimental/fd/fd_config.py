@@ -544,6 +544,15 @@ class FDConfig(_BaseConfig):
             "help": "Clipping coefficient for importance sampling in self-distillation. `None` disables clipping."
         },
     )
+    distillation_clip_teacher: float | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum deviation (in nats) of the teacher log-probs from the student log-probs before the "
+            "divergence, to stabilize training against an over-confident teacher. Only supported with "
+            "`distillation_mode='full_logits'` and the local teacher (not `use_teacher_server` / `use_liger_kernel`). "
+            "`None` (default) disables clipping."
+        },
+    )
     distillation_add_tail: bool = field(
         default=False,
         metadata={"help": "Whether to add a tail bucket for non-top-k probability mass."},
@@ -667,6 +676,17 @@ class FDConfig(_BaseConfig):
                 "`distillation_mode='sampled_token'` only supports reverse KL, so it requires "
                 f"`distillation_alpha=1.0`, got {self.distillation_alpha}."
             )
+        if self.distillation_clip_teacher is not None:
+            if self.distillation_mode != "full_logits":
+                raise ValueError(
+                    "`distillation_clip_teacher` is only supported with `distillation_mode='full_logits'`, got "
+                    f"`distillation_mode={self.distillation_mode!r}`."
+                )
+            if self.use_teacher_server or self.use_liger_kernel:
+                raise ValueError(
+                    "`distillation_clip_teacher` is only supported with the local teacher; it is not supported with "
+                    "`use_teacher_server` or `use_liger_kernel`."
+                )
         num_processes = self.world_size
         if self.generation_batch_size is None and self.steps_per_generation is None:
             self.steps_per_generation = self.gradient_accumulation_steps
