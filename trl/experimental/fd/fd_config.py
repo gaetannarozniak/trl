@@ -127,6 +127,9 @@ class FDConfig(_BaseConfig):
             List of at least two feedback phrasings, one per variant. If an entry contains a `{feedback}` placeholder
             it is substituted with the sample's dataset feedback (so `"{feedback}"` reproduces the standard single
             feedback); otherwise the entry is used verbatim as the feedback. Required when `aggregate_feedbacks=True`.
+        use_feedback_model (`bool`, *optional*, defaults to `False`):
+            Generate the teacher feedback with a dedicated feedback model instead of the dataset feedback. Mutually
+            exclusive with `aggregate_feedbacks`.
 
         > Parameters that control diagnostics
 
@@ -604,6 +607,13 @@ class FDConfig(_BaseConfig):
             "feedback); otherwise it is used verbatim. Required when `aggregate_feedbacks=True`."
         },
     )
+    use_feedback_model: bool = field(
+        default=False,
+        metadata={
+            "help": "Generate the teacher feedback with a dedicated feedback model instead of the dataset feedback. "
+            "Mutually exclusive with `aggregate_feedbacks`."
+        },
+    )
     max_reprompt_len: int = field(
         default=10240,
         metadata={"help": "Maximum length for reprompting in self-distillation."},
@@ -720,6 +730,12 @@ class FDConfig(_BaseConfig):
 
         if self.epsilon_high is None:
             self.epsilon_high = self.epsilon
+
+        if self.use_feedback_model and self.aggregate_feedbacks:
+            raise ValueError(
+                "`use_feedback_model` and `aggregate_feedbacks` cannot be enabled at the same time; they are "
+                "alternative teacher-context modes."
+            )
 
         if self.aggregate_feedbacks:
             if self.use_teacher_server:

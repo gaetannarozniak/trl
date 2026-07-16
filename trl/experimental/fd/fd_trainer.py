@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import inspect
 import os
 import re
@@ -148,6 +149,35 @@ def _extract_last_user_text(messages: list[dict[str, Any]]) -> str:
         return " ".join(part.get("text", "") for part in content if part.get("type") == "text")
     return content
 
+class FeedbackModel:
+    """Calls API to generate feedbacks from an LLM"""
+
+    def __init__(self):
+        from llama_api_client import AsyncLlamaAPIClient
+
+        self.model_name = "masequ"
+        with open("/storage/home/gaetan/keys/key_july", "r") as f:
+            api_key = f.read().strip()
+        self.client = AsyncLlamaAPIClient(api_key=api_key)
+        self.loop = asyncio.new_event_loop()
+    
+    def generate_responses(self, contents_list: list[str]):
+        # Return the raw responses (or None for failed calls) so the caller can inspect stop_reason.
+        return self.loop.run_until_complete(self._generate_all(contents_list))
+
+
+    async def _generate_all(self, contents_list):
+        async def one(content):
+            try:
+                return await self.client.chat.completions.create(
+                    messages=[{"role": "user", "content": content}],
+                    model=self.model_name, stream=False, max_completion_tokens=2048,
+                )
+            except Exception as e:
+                print(e)
+                return None
+        return await asyncio.gather(*(one(c) for c in contents_list))
+
 
 class SuccessfulRolloutTeacherContextBuilder:
     """Builds teacher contexts from successful rollouts"""
@@ -155,6 +185,8 @@ class SuccessfulRolloutTeacherContextBuilder:
     def __init__(self, trainer):
         self.trainer = trainer
         self.last_metrics: dict[str, float] = {}
+        if trainer.args.use_feedback_model:
+            self.feedback_model = FeedbackModel()
 
     def _build_reprompt_text(self, prompt_text: str, solution_text: str, feedback_text: str) -> str:
         return self.trainer.args.reprompt_template.format(
@@ -178,6 +210,82 @@ class SuccessfulRolloutTeacherContextBuilder:
                 teacher_prompt_ids, padding_value=self.trainer._tokenizer.pad_token_id, padding_side="left"
             ),
             "prompt_mask": pad(teacher_prompt_mask, padding_value=0, padding_side="left"),
+        }
+
+    def build_from_feedback_model(
+        self,
+        output: dict[str, torch.Tensor | Any],
+        prompts: list[Any],
+        rewards: torch.Tensor,
+        feedbacks: list[Any] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Build the feedback for the teacher from a feedback LLM model.
+        """
+        prompts_str: list[str] = [str(prompt) for prompt in prompts]
+        completions_str: list[str] = self.trainer._tokenizer.decode(output["completion_ids"])
+        assert len(prompts_str) == len(completions_str)
+
+        contents_list = []
+        for prompt, completion in zip(prompts_str, completions_str):
+            contents_list.append(f"Question: {prompt}\n\nModel answer: {completion}\n\nGiven the question and answer above, provide one single generalist and very concise piece of advice (under 20 words). Don't mention the model or its answer in your advice.")
+        responses = self.feedback_model.generate_responses(contents_list)
+
+        # Drop failed (None) and truncated (stop_reason == "length") generations, and strip the reasoning model's
+        # <think>...</think> block from the rest. Log the failure/truncation rates so a bug shows up fast.
+        feedbacks: list[str] = []
+        usable_flags: list[bool] = []
+        none_count = 0
+        truncated_count = 0
+        for response in responses:
+            if response is None:
+                none_count += 1
+                feedbacks.append("")
+                usable_flags.append(False)
+            elif response.completion_message.stop_reason == "length":
+                truncated_count += 1
+                feedbacks.append("")
+                usable_flags.append(False)
+            else:
+                text = response.completion_message.content.text
+                feedbacks.append(re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip())
+                usable_flags.append(True)
+
+        num_responses = max(1, len(responses))
+        self.last_metrics = {
+            "feedback_model/none_fraction": none_count / num_responses,
+            "feedback_model/truncated_fraction": truncated_count / num_responses,
+        }
+
+        completion_ids = output["completion_ids"]
+        completion_mask = output["completion_mask"]
+        device = self.trainer.accelerator.device
+
+        # Minimal teacher context: concatenate each usable feedback onto its prompt (no successful-rollout
+        # demonstration and no gating). Dropped samples keep the plain prompt and are masked out of the loss.
+        teacher_messages = []
+        for original_prompt, feedback, usable in zip(prompts, feedbacks, usable_flags):
+            if not usable:
+                teacher_messages.append(original_prompt)
+            elif isinstance(original_prompt, list):
+                system_messages = original_prompt[:-1]
+                prompt_text = _extract_last_user_text(original_prompt)
+                reprompt_text = self._build_reprompt_text(prompt_text, "", feedback)
+                teacher_messages.append(system_messages + [{"role": "user", "content": reprompt_text}])
+            else:
+                teacher_messages.append(self._build_reprompt_text(original_prompt, "", feedback))
+
+        teacher_batch = self._tokenize_teacher_messages(teacher_messages)
+        teacher_input_ids = torch.cat([teacher_batch["prompt_ids"], completion_ids], dim=1)
+        teacher_attention_mask = torch.cat([teacher_batch["prompt_mask"], completion_mask], dim=1)
+        self_distillation_mask = torch.tensor(usable_flags, dtype=torch.float, device=device)
+
+        return {
+            "teacher_input_ids": teacher_input_ids,
+            "teacher_attention_mask": teacher_attention_mask,
+            "teacher_prompt_ids": teacher_batch["prompt_ids"],
+            "teacher_prompt_mask": teacher_batch["prompt_mask"],
+            "self_distillation_mask": self_distillation_mask,
         }
 
     def build(
@@ -971,6 +1079,13 @@ class FDTrainer(_BaseTrainer):
         batch["advantages"] = local_advantages
         if self.args.aggregate_feedbacks:
             teacher_context = self._build_aggregated_teacher_context(batch, prompts, privileged_contexts)
+        elif self.args.use_feedback_model:
+            teacher_context = self.teacher_context_builder.build_from_feedback_model(
+                batch,
+                prompts,
+                batch["rewards"],
+                feedbacks=privileged_contexts,
+            )
         else:
             teacher_context = self.teacher_context_builder.build(
                 batch,
