@@ -284,11 +284,22 @@ class SuccessfulRolloutTeacherContextBuilder:
         teacher_attention_mask = torch.cat([teacher_batch["prompt_mask"], completion_mask], dim=1)
         self_distillation_mask = torch.tensor(apply_flags, dtype=torch.float, device=device)
 
+        # Aggregate the per-rank fractions across processes so the logged values reflect the full global batch
+        local_metrics = torch.tensor(
+            [
+                none_count / num_responses,
+                truncated_count / num_responses,
+                sum(incorrect_flags) / num_responses,
+                self_distillation_mask.float().mean().item(),
+            ],
+            device=device,
+        )
+        global_metrics = self.trainer.accelerator.gather(local_metrics.unsqueeze(0)).mean(0).tolist()
         self.last_metrics = {
-            "feedback_model/none_fraction": none_count / num_responses,
-            "feedback_model/truncated_fraction": truncated_count / num_responses,
-            "feedback_model/incorrect_fraction": sum(incorrect_flags) / num_responses,
-            "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+            "feedback_model/none_fraction": global_metrics[0],
+            "feedback_model/truncated_fraction": global_metrics[1],
+            "feedback_model/incorrect_fraction": global_metrics[2],
+            "self_distillation/reprompt_sample_fraction": global_metrics[3],
         }
 
         return {
