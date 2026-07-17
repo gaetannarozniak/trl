@@ -174,7 +174,7 @@ class FeedbackModel:
                     model=self.model_name, stream=False, max_completion_tokens=2048,
                 )
             except Exception as e:
-                print(e)
+                logger.warning(e)
                 return None
         return await asyncio.gather(*(one(c) for c in contents_list))
 
@@ -251,21 +251,25 @@ class SuccessfulRolloutTeacherContextBuilder:
                 feedbacks.append(re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip())
                 usable_flags.append(True)
 
+        # Correctness gating: when `feedback_only_on_incorrect`, only apply feedback to incorrect rollouts
+        # (reward < 0.5); correct rollouts get the plain prompt and are masked out of the loss.
+        incorrect_flags = [reward < 0.5 for reward in rewards.tolist()]
+        apply_flags = [
+            usable and (not self.trainer.args.feedback_only_on_incorrect or incorrect)
+            for usable, incorrect in zip(usable_flags, incorrect_flags)
+        ]
+
         num_responses = max(1, len(responses))
-        self.last_metrics = {
-            "feedback_model/none_fraction": none_count / num_responses,
-            "feedback_model/truncated_fraction": truncated_count / num_responses,
-        }
 
         completion_ids = output["completion_ids"]
         completion_mask = output["completion_mask"]
         device = self.trainer.accelerator.device
 
-        # Minimal teacher context: concatenate each usable feedback onto its prompt (no successful-rollout
-        # demonstration and no gating). Dropped samples keep the plain prompt and are masked out of the loss.
+        # Minimal teacher context: concatenate each applied feedback onto its prompt (no successful-rollout
+        # demonstration). Samples without applied feedback keep the plain prompt and are masked out of the loss.
         teacher_messages = []
-        for original_prompt, feedback, usable in zip(prompts, feedbacks, usable_flags):
-            if not usable:
+        for original_prompt, feedback, apply in zip(prompts, feedbacks, apply_flags):
+            if not apply:
                 teacher_messages.append(original_prompt)
             elif isinstance(original_prompt, list):
                 system_messages = original_prompt[:-1]
@@ -278,7 +282,14 @@ class SuccessfulRolloutTeacherContextBuilder:
         teacher_batch = self._tokenize_teacher_messages(teacher_messages)
         teacher_input_ids = torch.cat([teacher_batch["prompt_ids"], completion_ids], dim=1)
         teacher_attention_mask = torch.cat([teacher_batch["prompt_mask"], completion_mask], dim=1)
-        self_distillation_mask = torch.tensor(usable_flags, dtype=torch.float, device=device)
+        self_distillation_mask = torch.tensor(apply_flags, dtype=torch.float, device=device)
+
+        self.last_metrics = {
+            "feedback_model/none_fraction": none_count / num_responses,
+            "feedback_model/truncated_fraction": truncated_count / num_responses,
+            "feedback_model/incorrect_fraction": sum(incorrect_flags) / num_responses,
+            "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+        }
 
         return {
             "teacher_input_ids": teacher_input_ids,
@@ -1570,7 +1581,7 @@ class FDTrainer(_BaseTrainer):
         When `distillation_is_clip` is set and `old_per_token_logps` are available, the loss is corrected by a clipped
         importance-sampling ratio between the current student and the student at rollout time.
         """
-        if distillation_logits.loss_mask.sum() == 0:
+        if not self.args.use_feedback_model and distillation_logits.loss_mask.sum() == 0:
             mode = "train" if model.training else "eval"
             self._log_self_distillation_metric(mode, 0.0)
             # Keep the zero loss attached to the student graph so backward produces zero gradients instead of stopping.

@@ -130,6 +130,9 @@ class FDConfig(_BaseConfig):
         use_feedback_model (`bool`, *optional*, defaults to `False`):
             Generate the teacher feedback with a dedicated feedback model instead of the dataset feedback. Mutually
             exclusive with `aggregate_feedbacks`.
+        feedback_only_on_incorrect (`bool`, *optional*, defaults to `False`):
+            When `use_feedback_model=True`, only apply the generated feedback to incorrect rollouts (reward < 0.5).
+            Correct rollouts keep the plain prompt and are masked out of the self-distillation loss.
 
         > Parameters that control diagnostics
 
@@ -612,6 +615,13 @@ class FDConfig(_BaseConfig):
         metadata={
             "help": "Generate the teacher feedback with a dedicated feedback model instead of the dataset feedback. "
             "Mutually exclusive with `aggregate_feedbacks`."
+        },
+    )
+    feedback_only_on_incorrect: bool = field(
+        default=False,
+        metadata={
+            "help": "When `use_feedback_model=True`, only apply the generated feedback to incorrect rollouts "
+            "(reward < 0.5); correct rollouts get the plain prompt and are masked out of the self-distillation loss."
         },
     )
     max_reprompt_len: int = field(

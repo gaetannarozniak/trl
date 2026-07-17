@@ -25,3 +25,4 @@ num_generations_eval: 1
 ddp_find_unused_parameters: True
 scale_rewards: true
 use_feedback_model: true
+diagnostics_flat_tolerance: -1
