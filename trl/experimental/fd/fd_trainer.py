@@ -227,8 +227,11 @@ class SuccessfulRolloutTeacherContextBuilder:
         assert len(prompts_str) == len(completions_str)
 
         contents_list = []
-        for prompt, completion in zip(prompts_str, completions_str):
-            contents_list.append(f"Question: {prompt}\n\nModel answer: {completion}\n\nGiven the question and answer above, provide one single generalist and very concise piece of advice (under 20 words). Don't mention the model or its answer in your advice.")
+        for prompt, completion, reward in zip(prompts_str, completions_str, rewards):
+            is_success = reward > 0.5
+            contents_list.append(f"Question: {prompt}\n\nModel answer: {completion}\n\nGiven the question and answer above, provide one single generalist and very concise piece of advice (under 20 words). Don't mention the model or its answer in your advice.\n")
+            if not is_success:
+                contents_list[-1] += "\nThe model answer is incorrect, try first to understand why, and only provide an advice if you understand why. Else output NO_ADVICE.\n"
         responses = self.feedback_model.generate_responses(contents_list)
 
         # Drop failed (None) and truncated (stop_reason == "length") generations, and strip the reasoning model's
