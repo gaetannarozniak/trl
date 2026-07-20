@@ -206,13 +206,10 @@ class OPSFTTrainer(_GRPOTrainer):
         if self.compute_eval_kl and mode == "eval":
             self._log_eval_kl(input_ids, attention_mask, logits_to_keep, logps, mask, mode)
 
-        # 2. u = ∇_θ log π(y | x): the SFT gradient of the *dataset reference* (x, y), a constant vector in parameter
-        # space. A separate forward on the reference tokens gives log π(y | x); one backward (no `create_graph`) gives
-        # u, which we detach so it acts as a constant in the JVP below. This forward goes through the *unwrapped* model:
-        # DDP calls `prepare_for_backward` at the end of every wrapped forward, so a second wrapped forward would corrupt
-        # the reducer state that the final `loss.backward()` (on the step-1 graph) relies on. `autograd.grad` also skips
-        # DDP's all-reduce, so u is the local (per-rank) SFT gradient — good enough for a preconditioning direction.
-        params = [p for p in model.parameters() if p.requires_grad]
+        # 2. Reference forward: log π(y | x) on the *dataset reference* (x, y). This gives both the reference
+        # cross-entropy (logged in both modes) and, in training, the SFT direction u. The forward goes through the
+        # *unwrapped* model: DDP calls `prepare_for_backward` at the end of every wrapped forward, so a second wrapped
+        # forward would corrupt the reducer state that the final `loss.backward()` (on the step-1 graph) relies on.
         unwrapped_model = self.accelerator.unwrap_model(model)
         ref_completion_mask = inputs["ref_completion_mask"]
         ref_input_ids = torch.cat([inputs["ref_prompt_ids"], inputs["ref_completion_ids"]], dim=1)
@@ -227,34 +224,14 @@ class OPSFTTrainer(_GRPOTrainer):
             compute_aux_loss=False,
         )
         ref_logp = (ref_per_token_logps * ref_completion_mask).sum()  # scalar = Σ_batch log π(y | x)
-        u = torch.autograd.grad(ref_logp, params, allow_unused=True)
-        u = [torch.zeros_like(p) if g is None else g.detach() for p, g in zip(params, u)]
 
-        # Eval-only probe (not used for training): the model's per-token log π(y | x) on the reference.
+        # Reference cross-entropy per token (−mean log π(y | x)): logged in both modes and, at eval, returned as the
+        # eval loss (directly comparable to a plain-SFT baseline's eval loss).
         ref_logp_mean = ref_logp.detach() / ref_completion_mask.sum().clamp(min=1.0)
         self._metrics[mode]["ref_logp"].append(self.accelerator.gather(ref_logp_mean).nanmean().item())
 
-        # 3. c = J u: the directional derivative of each log f_t along u, i.e. c_t = grad log f_t . u. We get all T of
-        # them with one JVP, built from two reverse-mode passes ("double backward") to avoid forward-mode AD:
-        #   w = grad(v . logps) = J^T v          (linear in the dummy vector v)
-        #   c = grad_v (w . u) = grad_v (v^T J u) = J u
-        v = torch.zeros_like(logps, requires_grad=True)  # (T,), dummy vector
-        w = torch.autograd.grad((v * logps).sum(), params, create_graph=True, allow_unused=True)  # list of param-shaped tensors = J^T v
-        inner = sum((w_p * u_p).sum() for w_p, u_p in zip(w, u) if w_p is not None)  # scalar () = w . u = v^T J u
-        c = torch.autograd.grad(inner, v, retain_graph=True)[0].detach()  # (T,) = J u
-
-        # 4. Surrogate loss whose gradient is S = J^T c = F u. `c` is detached, so backprop only flows through logps;
-        # `retain_graph=True` above keeps the forward graph alive for this backward. Normalized by the number of
-        # generated tokens (mean) and by the gradient-accumulation count, matching GRPO (HF auto-scaling is off here).
-        loss = - (c * logps).sum() / mask.sum().clamp(min=1.0)
-        normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0
-        loss = loss / normalizer
-
-        # The magnitude of c (= J u, the reference-gradient response of each self-generated token) is the key quantity
-        # to watch: it sets the effective step size and can be large, so log it.
-        self._metrics[mode]["c_abs_mean"].append(self.accelerator.gather(c.abs().mean()).nanmean().item())
-        # Weight-movement probes. `param_drift` = ‖θ_t − θ₀‖ is the reliable signal; ‖θ‖ is near-invariant. No gather:
-        # params are replicated across ranks (DDP), so every rank holds identical values.
+        # Weight-movement probes (both modes). `param_drift` = ‖θ_t − θ₀‖ is the reliable signal; ‖θ‖ is near-invariant.
+        # No gather: params are replicated across ranks (DDP), so every rank holds identical values.
         with torch.no_grad():
             params_list = list(model.parameters())
             if self._theta0 is None:
@@ -263,4 +240,36 @@ class OPSFTTrainer(_GRPOTrainer):
             param_norm = torch.stack([p.norm() for p in params_list]).norm()
         self._metrics[mode]["param_drift"].append(param_drift.item())
         self._metrics[mode]["param_norm"].append(param_norm.item())
+
+        # Eval takes no optimizer step and the eval loop runs under `torch.no_grad`, so the autograd-based direction u
+        # and the JVP c below cannot be built (and enabling grad here would break DDP's reducer). Return the reference
+        # cross-entropy as the eval loss; the diagnostics above plus reward-based accuracy are all we track at eval.
+        if mode == "eval":
+            return -ref_logp_mean
+
+        # 3. u = ∇_θ log π(y | x): the SFT gradient of the reference, a constant vector in parameter space. One backward
+        # (no `create_graph`) gives u, which we detach so it acts as a constant in the JVP below. `autograd.grad` skips
+        # DDP's all-reduce, so u is the local (per-rank) SFT gradient — good enough for a preconditioning direction.
+        params = [p for p in model.parameters() if p.requires_grad]
+        u = torch.autograd.grad(ref_logp, params, allow_unused=True)
+        u = [torch.zeros_like(p) if g is None else g.detach() for p, g in zip(params, u)]
+
+        # 4. c = J u: the directional derivative of each log f_t along u, i.e. c_t = grad log f_t . u. We get all T of
+        # them with one JVP, built from two reverse-mode passes ("double backward") to avoid forward-mode AD:
+        #   w = grad(v . logps) = J^T v          (linear in the dummy vector v)
+        #   c = grad_v (w . u) = grad_v (v^T J u) = J u
+        v = torch.zeros_like(logps, requires_grad=True)  # (T,), dummy vector
+        w = torch.autograd.grad((v * logps).sum(), params, create_graph=True, allow_unused=True)  # list of param-shaped tensors = J^T v
+        inner = sum((w_p * u_p).sum() for w_p, u_p in zip(w, u) if w_p is not None)  # scalar () = w . u = v^T J u
+        c = torch.autograd.grad(inner, v, retain_graph=True)[0].detach()  # (T,) = J u
+
+        # 5. Surrogate loss whose gradient is S = J^T c = F u. `c` is detached, so backprop only flows through logps;
+        # `retain_graph=True` above keeps the forward graph alive for this backward. Normalized by the number of
+        # generated tokens (mean) and by the gradient-accumulation count, matching GRPO (HF auto-scaling is off here).
+        loss = - (c * logps).sum() / mask.sum().clamp(min=1.0)
+        loss = loss / self.current_gradient_accumulation_steps
+
+        # The magnitude of c (= J u, the reference-gradient response of each self-generated token) is the key quantity
+        # to watch: it sets the effective step size and can be large, so log it.
+        self._metrics[mode]["c_abs_mean"].append(self.accelerator.gather(c.abs().mean()).nanmean().item())
         return loss
