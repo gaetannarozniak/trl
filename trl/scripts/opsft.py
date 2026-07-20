@@ -80,6 +80,7 @@ trainer = OPSFTTrainer(
         per_device_eval_batch_size=8,
         eval_strategy="steps",
         eval_steps=50,
+        eval_on_start=True,
         logging_steps=1,
         compute_eval_kl=True,  # log eval_kl vs. the frozen base θ₀ (catastrophic-forgetting probe)
         # use_vllm=True,  # optional; colocate by default
@@ -88,6 +89,6 @@ trainer = OPSFTTrainer(
         num_completions_to_print=1,
     ),
     train_dataset=dataset["train"],
-    eval_dataset=dataset["test"],
+    eval_dataset=dataset["test"].select(range(128)),  # fixed 128-sample eval subset (faster, comparable across runs)
 )
 trainer.train()
