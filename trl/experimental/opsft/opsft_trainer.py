@@ -146,8 +146,7 @@ class OPSFTTrainer(_GRPOTrainer):
         # 4. Surrogate loss whose gradient is S = J^T c = F u. `c` is detached, so backprop only flows through logps;
         # `retain_graph=True` above keeps the forward graph alive for this backward. Normalized by the number of
         # generated tokens (mean) and by the gradient-accumulation count, matching GRPO (HF auto-scaling is off here).
-        mode = "train" if self.model.training else "eval"
-        loss = (c * logps).sum() / mask.sum().clamp(min=1.0)
+        loss = - (c * logps).sum() / mask.sum().clamp(min=1.0)
         normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0
         loss = loss / normalizer
 
