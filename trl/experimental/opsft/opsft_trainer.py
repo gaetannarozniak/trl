@@ -247,11 +247,15 @@ class OPSFTTrainer(_GRPOTrainer):
         if mode == "eval":
             return -ref_logp_mean
 
-        # 3. u = ∇_θ log π(y | x): the SFT gradient of the reference, a constant vector in parameter space. One backward
-        # (no `create_graph`) gives u, which we detach so it acts as a constant in the JVP below. `autograd.grad` skips
-        # DDP's all-reduce, so u is the local (per-rank) SFT gradient — good enough for a preconditioning direction.
+        # 3. u = ∇_θ log π(y | x): the SFT gradient of the reference, a constant vector in parameter space. We take the
+        # gradient of the *mean* (÷ token count) log π(y | x) rather than the sum, so u is the per-token SFT gradient —
+        # matching both the generated-token normalization of the loss (step 5) and a plain-SFT baseline (mean cross
+        # entropy), which makes the step scale-invariant to answer length. One backward (no `create_graph`) gives u,
+        # which we detach so it acts as a constant in the JVP below. `autograd.grad` skips DDP's all-reduce, so u is the
+        # local (per-rank) SFT gradient — good enough for a preconditioning direction.
         params = [p for p in model.parameters() if p.requires_grad]
-        u = torch.autograd.grad(ref_logp, params, allow_unused=True)
+        ref_token_count = ref_completion_mask.sum().clamp(min=1.0)
+        u = torch.autograd.grad(ref_logp / ref_token_count, params, allow_unused=True)
         u = [torch.zeros_like(p) if g is None else g.detach() for p, g in zip(params, u)]
 
         # 4. c = J u: the directional derivative of each log f_t along u, i.e. c_t = grad log f_t . u. We get all T of
