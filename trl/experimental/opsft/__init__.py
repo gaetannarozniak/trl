@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .opsft_config import OPSFTConfig
 from .opsft_trainer import OPSFTTrainer
 
 
-__all__ = ["OPSFTTrainer"]
+__all__ = ["OPSFTConfig", "OPSFTTrainer"]

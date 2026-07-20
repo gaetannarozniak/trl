@@ -15,8 +15,9 @@
 import torch
 
 from ...data_utils import apply_chat_template, is_conversational
+from ...models import prepare_deepspeed, prepare_fsdp
 from ...trainer.grpo_trainer import GRPOTrainer as _GRPOTrainer
-from ...trainer.utils import pad
+from ...trainer.utils import create_model_from_path, get_config_model_id, pad
 
 
 def _no_reward(completions, **kwargs):
@@ -73,18 +74,18 @@ class OPSFTTrainer(_GRPOTrainer):
     ```python
     from datasets import load_dataset
     from transformers import AutoModelForCausalLM
-    from trl import GRPOConfig
-    from trl.experimental.opsft import OPSFTTrainer
+    from trl.experimental.opsft import OPSFTConfig, OPSFTTrainer
 
     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B", attn_implementation="eager")
     dataset = load_dataset("trl-lib/tldr", split="train")  # prompt-completion dataset (x, y)
     trainer = OPSFTTrainer(
         model=model,
-        args=GRPOConfig(
+        args=OPSFTConfig(
             output_dir="Qwen2.5-0.5B-OPSFT",
             gradient_checkpointing=False,
             bf16=True,
             use_vllm=True,  # optional; colocate by default
+            compute_eval_kl=True,  # optional; log eval_kl vs. the frozen base model
         ),
         train_dataset=dataset,
     )
@@ -104,6 +105,50 @@ class OPSFTTrainer(_GRPOTrainer):
         super().__init__(model=model, reward_funcs=reward_funcs, args=args, **kwargs)
         # Snapshot of the initial parameters θ₀ (captured lazily on the first `_compute_loss` call) to log drift.
         self._theta0 = None
+        # Eval-only KL diagnostic: hold a frozen base model θ₀ and log KL(policy ‖ base) at eval (see `_log_eval_kl`).
+        self.compute_eval_kl = args.compute_eval_kl
+        if self.compute_eval_kl and args.beta != 0.0:
+            # `beta != 0.0` already makes GRPO load its own frozen reference model (`self.ref_model`); holding a second
+            # frozen base model here would keep two copies of θ₀ in memory. Pick one KL source.
+            raise ValueError(
+                "`compute_eval_kl=True` cannot be combined with `beta != 0.0`: both hold a frozen copy of the base "
+                "model. Set `beta=0.0`, or leave `compute_eval_kl=False` and use GRPO's own `kl` metric."
+            )
+        self.base_model = self._create_base_model(args) if self.compute_eval_kl else None
+
+    def _create_base_model(self, args):
+        # Build the frozen base model θ₀ used only for the eval-time KL diagnostic. Independent of GRPO's
+        # `beta`-gated `self.ref_model` (which is `None` at `beta == 0.0`): we hold our own copy and never sync it
+        # forward, so it stays pinned to the initial weights. Built and prepared exactly like GRPO's reference model
+        # (fresh reload of the base checkpoint, put in eval mode via `evaluation_mode=True`).
+        model_init_kwargs = dict(args.model_init_kwargs or {})  # copy to avoid mutating model_init_kwargs
+        # Distributed training requires device_map=None ("auto" fails)
+        if self.args.distributed_state.distributed_type in ["MULTI_GPU", "DEEPSPEED"]:
+            model_init_kwargs["device_map"] = None
+        model_init_kwargs.setdefault("trust_remote_code", args.trust_remote_code)
+        base_model_id = get_config_model_id(self.accelerator.unwrap_model(self.model).config)
+        base_model = create_model_from_path(base_model_id, **model_init_kwargs)
+        if self.is_deepspeed_enabled:
+            return prepare_deepspeed(base_model, self.accelerator)
+        elif self.is_fsdp_enabled:
+            return prepare_fsdp(base_model, self.accelerator)
+        else:
+            return self.accelerator.prepare_model(base_model, evaluation_mode=True)
+
+    def _log_eval_kl(self, input_ids, attention_mask, logits_to_keep, logps, mask, mode):
+        # KL between the policy and the frozen base θ₀ over the self-generated completions, via GRPO's k3 estimator
+        # `exp(Δ) - Δ - 1` (Δ = log f_base - log f). Never enters the loss; runs under the eval loop's `no_grad`.
+        base_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
+            self.base_model,
+            input_ids,
+            attention_mask,
+            logits_to_keep,
+            compute_entropy=False,
+            compute_aux_loss=False,
+        )
+        base_logps = base_per_token_logps[mask.bool()]  # (T,), aligned with `logps`
+        per_token_kl = torch.exp(base_logps - logps) - (base_logps - logps) - 1  # k3 estimator of KL(policy ‖ base)
+        self._metrics[mode]["kl"].append(self.accelerator.gather(per_token_kl.mean()).nanmean().item())
 
     def _generate_and_score_completions(self, inputs):
         # Run GRPO's usual on-policy rollout (self-generated ỹ defines the Fisher J), then additionally tokenize the
@@ -156,6 +201,10 @@ class OPSFTTrainer(_GRPOTrainer):
         )
         logps = per_token_logps[mask.bool()]  # (T,), keep only the (non-padded) generated tokens
         mode = "train" if self.model.training else "eval"
+
+        # Eval-only KL(policy ‖ base θ₀) diagnostic over the self-generated eval completions (see `_log_eval_kl`).
+        if self.compute_eval_kl and mode == "eval":
+            self._log_eval_kl(input_ids, attention_mask, logits_to_keep, logps, mask, mode)
 
         # 2. u = ∇_θ log π(y | x): the SFT gradient of the *dataset reference* (x, y), a constant vector in parameter
         # space. A separate forward on the reference tokens gives log π(y | x); one backward (no `create_graph`) gives
