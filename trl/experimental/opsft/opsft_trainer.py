@@ -153,16 +153,6 @@ class OPSFTTrainer(_GRPOTrainer):
             logits_to_keep,
             compute_entropy=False,
             compute_aux_loss=False,
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            num_images=inputs.get("num_images"),
-            pixel_attention_mask=inputs.get("pixel_attention_mask"),
-            spatial_shapes=inputs.get("spatial_shapes"),
-            num_tiles=inputs.get("num_tiles"),
-            image_sizes=inputs.get("image_sizes"),
-            token_type_ids=inputs.get("token_type_ids"),
-            mm_token_type_ids=inputs.get("mm_token_type_ids"),
-            image_position_ids=inputs.get("image_position_ids"),
         )
         logps = per_token_logps[mask.bool()]  # (T,), keep only the (non-padded) generated tokens
         mode = "train" if self.model.training else "eval"
