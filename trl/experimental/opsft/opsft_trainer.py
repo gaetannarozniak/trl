@@ -17,7 +17,7 @@ import torch
 from ...data_utils import apply_chat_template, is_conversational
 from ...models import prepare_deepspeed, prepare_fsdp
 from ...trainer.grpo_trainer import GRPOTrainer as _GRPOTrainer
-from ...trainer.utils import create_model_from_path, get_config_model_id, pad
+from ...trainer.utils import create_model_from_path, get_config_model_id, pad, selective_log_softmax
 
 
 def _no_reward(completions, **kwargs):
@@ -53,18 +53,17 @@ class OPSFTTrainer(_GRPOTrainer):
     $$
 
     whose gradient is exactly $\nabla_\theta L = J^\top c = F u = S$ ($\operatorname{sg}$ is stop-gradient). The
-    directional derivatives $c = J u$ are obtained with a single training forward pass and a double reverse-mode pass
-    (a JVP built from two VJPs), so the cost is ~1 forward + 3 backward-equivalents and the memory is independent of
-    both the number of tokens and $\dim\theta$ — $J$ is never materialized.
+    directional derivatives $c = J u$ are obtained with forward-mode autodiff ([`torch.func.jvp`]), so $J$ is never
+    materialized and the memory is independent of both the number of tokens and $\dim\theta$.
 
     <Tip warning={true}>
 
-    The double backward (`create_graph=True`) in the *training* forward constrains the setup (generation is a
-    separate no-grad path and is unaffected, so vLLM composes fine):
+    The forward-mode JVP ([`torch.func.jvp`]) that computes $c$ constrains the setup (generation is a separate
+    no-grad path and is unaffected, so vLLM composes fine):
 
-    - Load the model with `attn_implementation="eager"` (flash/SDPA attention kernels do not support double backward).
+    - Load the model with `attn_implementation="eager"` (flash/SDPA attention kernels do not support forward-mode AD).
     - Set `gradient_checkpointing=False` in the [`GRPOConfig`].
-    - Prefer `bf16=True` over `fp16=True` (the fp16 gradient scaler interferes with the inner gradients).
+    - Prefer `bf16=True` over `fp16=True` (the fp16 gradient scaler interferes with the JVP).
     - Do not use DeepSpeed ZeRO (gradients with respect to partitioned parameters are unavailable).
 
     </Tip>
@@ -150,6 +149,32 @@ class OPSFTTrainer(_GRPOTrainer):
         per_token_kl = torch.exp(base_logps - logps) - (base_logps - logps) - 1  # k3 estimator of KL(policy ‖ base)
         self._metrics[mode]["kl"].append(self.accelerator.gather(per_token_kl.mean()).nanmean().item())
 
+    def _compute_c_torch_jvp(self, model, param_names, params, u, input_ids, attention_mask, logits_to_keep, mask):
+        # c = J u via forward-mode autodiff. J is the Jacobian of the map (θ ↦ per-token logps), so c = J u is exactly
+        # the jvp of that map at the current params with tangent u. This never materializes J^T v over all params nor a
+        # second-order graph — it propagates a single tangent through one forward. Requires forward-mode-capable ops
+        # (eager attention). The functional forward mirrors the text-only path of `_get_per_token_logps_and_entropies`
+        # so the returned logps (hence c) align with `logps` from step 1.
+        def logps_of_params(*param_values):
+            model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "use_cache": False}
+            if "logits_to_keep" in self.model_kwarg_keys:
+                model_inputs["logits_to_keep"] = logits_to_keep + 1  # +1: the last logit (next-token pred) is dropped
+            params_dict = dict(zip(param_names, param_values))
+            logits = torch.func.functional_call(model, params_dict, args=(), kwargs=model_inputs).logits
+            logits = logits[:, :-1, :][:, -logits_to_keep:, :] / self.temperature  # (B, logits_to_keep, V)
+            per_token_logps = selective_log_softmax(logits, input_ids[:, -logits_to_keep:])  # (B, logits_to_keep)
+            return per_token_logps[mask.bool()]  # (T,)
+
+        _, c = torch.func.jvp(logps_of_params, tuple(params), tuple(u))
+        return c.detach()  # (T,) = J u
+
+    def _log_peak_memory(self, mode):
+        # Peak CUDA memory allocated during this `_compute_loss` call (the tracker is reset at its start), so the two
+        # `c` implementations can be compared. Excludes the later surrogate `loss.backward()`, which is identical for
+        # both. No gather: report each rank's own peak.
+        if torch.cuda.is_available():
+            self._metrics[mode]["peak_mem_gb"].append(torch.cuda.max_memory_allocated() / 1e9)
+
     def _generate_and_score_completions(self, inputs):
         # Run GRPO's usual on-policy rollout (self-generated ỹ defines the Fisher J), then additionally tokenize the
         # dataset reference (x, y) so `_compute_loss` can build u = ∇ log π(y|x). The raw `inputs` list is already
@@ -182,6 +207,10 @@ class OPSFTTrainer(_GRPOTrainer):
         return output
 
     def _compute_loss(self, model, inputs):
+        # Reset the CUDA peak tracker so `_log_peak_memory` reports the peak of *this* call (double-backward vs jvp).
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
         # 1. Per-token log f_t = log pi(y_t | x, y_<t) of the self-generated completion. Reuse GRPO's helper (same
         # call as GRPOTrainer._compute_loss), but we need neither entropy nor the MoE aux loss here.
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
@@ -245,6 +274,7 @@ class OPSFTTrainer(_GRPOTrainer):
         # and the JVP c below cannot be built (and enabling grad here would break DDP's reducer). Return the reference
         # cross-entropy as the eval loss; the diagnostics above plus reward-based accuracy are all we track at eval.
         if mode == "eval":
+            self._log_peak_memory(mode)
             return -ref_logp_mean
 
         # 3. u = ∇_θ log π(y | x): the SFT gradient of the reference, a constant vector in parameter space. We take the
@@ -253,27 +283,27 @@ class OPSFTTrainer(_GRPOTrainer):
         # entropy), which makes the step scale-invariant to answer length. One backward (no `create_graph`) gives u,
         # which we detach so it acts as a constant in the JVP below. `autograd.grad` skips DDP's all-reduce, so u is the
         # local (per-rank) SFT gradient — good enough for a preconditioning direction.
-        params = [p for p in model.parameters() if p.requires_grad]
+        named_params = [(n, p) for n, p in unwrapped_model.named_parameters() if p.requires_grad]
+        param_names = [n for n, _ in named_params]
+        params = [p for _, p in named_params]
         ref_token_count = ref_completion_mask.sum().clamp(min=1.0)
         u = torch.autograd.grad(ref_logp / ref_token_count, params, allow_unused=True)
         u = [torch.zeros_like(p) if g is None else g.detach() for p, g in zip(params, u)]
 
-        # 4. c = J u: the directional derivative of each log f_t along u, i.e. c_t = grad log f_t . u. We get all T of
-        # them with one JVP, built from two reverse-mode passes ("double backward") to avoid forward-mode AD:
-        #   w = grad(v . logps) = J^T v          (linear in the dummy vector v)
-        #   c = grad_v (w . u) = grad_v (v^T J u) = J u
-        v = torch.zeros_like(logps, requires_grad=True)  # (T,), dummy vector
-        w = torch.autograd.grad((v * logps).sum(), params, create_graph=True, allow_unused=True)  # list of param-shaped tensors = J^T v
-        inner = sum((w_p * u_p).sum() for w_p, u_p in zip(w, u) if w_p is not None)  # scalar () = w . u = v^T J u
-        c = torch.autograd.grad(inner, v, retain_graph=True)[0].detach()  # (T,) = J u
+        # 4. c = J u: the directional derivative of each log f_t along u, i.e. c_t = grad log f_t . u, computed with
+        # forward-mode autodiff (see `_compute_c_torch_jvp`).
+        c = self._compute_c_torch_jvp(
+            unwrapped_model, param_names, params, u, input_ids, attention_mask, logits_to_keep, mask
+        )
 
         # 5. Surrogate loss whose gradient is S = J^T c = F u. `c` is detached, so backprop only flows through logps;
-        # `retain_graph=True` above keeps the forward graph alive for this backward. Normalized by the number of
-        # generated tokens (mean) and by the gradient-accumulation count, matching GRPO (HF auto-scaling is off here).
+        # the step-1 forward graph is kept alive for this backward. Normalized by the number of generated tokens (mean)
+        # and by the gradient-accumulation count, matching GRPO (HF auto-scaling is off here).
         loss = - (c * logps).sum() / mask.sum().clamp(min=1.0)
         loss = loss / self.current_gradient_accumulation_steps
 
         # The magnitude of c (= J u, the reference-gradient response of each self-generated token) is the key quantity
         # to watch: it sets the effective step size and can be large, so log it.
         self._metrics[mode]["c_abs_mean"].append(self.accelerator.gather(c.abs().mean()).nanmean().item())
+        self._log_peak_memory(mode)
         return loss
