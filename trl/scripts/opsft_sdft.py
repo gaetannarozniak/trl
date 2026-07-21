@@ -208,7 +208,7 @@ model = AutoModelForCausalLM.from_pretrained(MODEL, attn_implementation="eager")
 trainer = OPSFTTrainer(
     model=model,
     args=OPSFTConfig(
-        output_dir="Qwen2.5-7B-OPSFT-science",
+        output_dir="checkpoints/Qwen2.5-7B-OPSFT-science",
         gradient_checkpointing=False,
         bf16=True,
         optim="adamw_8bit",

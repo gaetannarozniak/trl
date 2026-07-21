@@ -208,7 +208,7 @@ trainer = SFTTrainer(
     model=model,
     # Hyperparameters from the SDFT paper, Table 3 (SFT column). Curly-brace entries are paper sweeps — pick per run.
     args=SFTConfig(
-        output_dir="Qwen2.5-7B-SFT-science",
+        output_dir="checkpoints/Qwen2.5-7B-SFT-science",
         bf16=True,  # paper: bfloat16 True
         optim="adamw_torch",  # paper: adamw
         learning_rate=1e-5,  # paper sweep {5e-6, 1e-5, 5e-5}

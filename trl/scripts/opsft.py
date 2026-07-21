@@ -47,7 +47,7 @@ trainer = OPSFTTrainer(
     # current accuracy on both splits.
     reward_funcs=accuracy_reward,
     args=OPSFTConfig(
-        output_dir="Qwen3.5-2B-OPSFT-gsm8k",
+        output_dir="checkpoints/Qwen3.5-2B-OPSFT-gsm8k",
         gradient_checkpointing=False,
         bf16=True,
         max_completion_length=512,  # GSM8K chains of thought are long
