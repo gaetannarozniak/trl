@@ -1,0 +1,32 @@
+# Default config for trl/scripts/sft_sdft.py (plain-SFT baseline on the SDFT science task).
+# Hyperparameters from the SDFT paper, Table 3 (SFT column); curly-brace entries there are sweeps — override per run:
+#   torchrun --nproc_per_node=8 trl/scripts/sft_sdft.py \
+#       --config trl/scripts/configs/sft_sdft.yaml \
+#       --run_name "sft science lr5e-5" --learning_rate 5e-5 --num_train_epochs 1
+
+# --- SFTConfig (trainer) ---
+output_dir: checkpoints/Qwen2.5-7B-SFT-science
+bf16: true                      # paper: bfloat16
+optim: adamw_torch              # paper: adamw
+learning_rate: 1.0e-5           # paper sweep {5e-6, 1e-5, 5e-5}
+lr_scheduler_type: cosine       # paper: cosine w. warmup
+warmup_steps: 10                # paper: 10
+num_train_epochs: 2             # paper sweep {1, 2}
+per_device_train_batch_size: 4  # global batch = this x #GPUs x grad_accum; paper sweep {16, 32, 64}
+max_grad_norm: 1.0              # paper: 1
+weight_decay: 0.0               # paper: 0
+max_length: 2048
+completion_only_loss: true      # SFT on the demonstration answer y (prompt masked)
+logging_steps: 1
+eval_strategy: "no"             # accuracy eval is driven by the callback, not HF's eval loop
+report_to: [wandb]
+
+# --- ScriptArguments (script-level) ---
+model_name: Qwen/Qwen2.5-7B-Instruct
+sdft_data: /home/gaetan/projects/SDFT/data
+eval_every: 50
+gen_batch_size: 8
+science_eval_size: 64
+tooluse_eval_size: null
+science_max_new_tokens: 2048
+tooluse_max_new_tokens: 2048

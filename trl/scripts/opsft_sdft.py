@@ -14,27 +14,44 @@ import json
 import os
 import re
 from collections import Counter
+from dataclasses import dataclass
 
 import torch
 from accelerate.utils import gather_object
 from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 
+from trl import TrlParser
 from trl.experimental.opsft import OPSFTConfig, OPSFTTrainer
 from trl.models import unwrap_model_for_generation
 
 
 os.environ["WANDB_PROJECT"] = "opsft"
 
-MODEL = "Qwen/Qwen2.5-7B-Instruct"
-SDFT_DATA = "/home/gaetan/projects/SDFT/data"
 
-EVAL_EVERY = 50  # run the accuracy eval every N optimizer steps
-GEN_BATCH_SIZE = 8  # generation micro-batch (per process)
-SCIENCE_EVAL_SIZE = 64  # None = all 507; subset keeps each eval fast
-TOOLUSE_EVAL_SIZE = None  # None = all 97
-SCIENCE_MAX_NEW_TOKENS = 512  # must be long enough for <reasoning>…</reasoning><answer>…</answer>
-TOOLUSE_MAX_NEW_TOKENS = 512
+@dataclass
+class ScriptArguments:
+    # Script-level knobs; everything else is OPSFTConfig, overridable on the CLI or via `--config <yaml>`.
+    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
+    sdft_data: str = "/home/gaetan/projects/SDFT/data"
+    eval_every: int = 50  # run the accuracy eval every N optimizer steps
+    gen_batch_size: int = 8  # generation micro-batch (per process)
+    science_eval_size: int | None = 64  # None = all 507
+    tooluse_eval_size: int | None = None  # None = all 97
+    science_max_new_tokens: int = 512  # long enough for <reasoning>…</reasoning><answer>…</answer>
+    tooluse_max_new_tokens: int = 512
+
+
+script_args, training_args = TrlParser((ScriptArguments, OPSFTConfig)).parse_args_and_config()
+
+MODEL = script_args.model_name
+SDFT_DATA = script_args.sdft_data
+EVAL_EVERY = script_args.eval_every
+GEN_BATCH_SIZE = script_args.gen_batch_size
+SCIENCE_EVAL_SIZE = script_args.science_eval_size
+TOOLUSE_EVAL_SIZE = script_args.tooluse_eval_size
+SCIENCE_MAX_NEW_TOKENS = script_args.science_max_new_tokens
+TOOLUSE_MAX_NEW_TOKENS = script_args.tooluse_max_new_tokens
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -207,19 +224,7 @@ if TOOLUSE_EVAL_SIZE is not None:
 model = AutoModelForCausalLM.from_pretrained(MODEL, attn_implementation="eager")
 trainer = OPSFTTrainer(
     model=model,
-    args=OPSFTConfig(
-        output_dir="checkpoints/Qwen2.5-7B-OPSFT-science",
-        gradient_checkpointing=False,
-        bf16=True,
-        optim="adamw_8bit",
-        max_completion_length=SCIENCE_MAX_NEW_TOKENS,
-        num_generations=2,
-        per_device_train_batch_size=1,
-        logging_steps=1,
-        eval_strategy="no",  # accuracy eval is driven by the callback, not HF's eval loop
-        report_to=["wandb"],
-        learning_rate=1e-5,
-    ),
+    args=training_args,
     train_dataset=science_train,
 )
 trainer.add_callback(GenerationEvalCallback(trainer, science_eval, tooluse_eval))

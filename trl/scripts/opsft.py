@@ -1,13 +1,25 @@
 import os
+from dataclasses import dataclass
 
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM
 
+from trl import TrlParser
 from trl.experimental.opsft import OPSFTConfig, OPSFTTrainer
 from trl.rewards import accuracy_reward  # math_verify-based; needs `pip install math_verify latex2sympy2_extended`
 
 
 os.environ["WANDB_PROJECT"] = "opsft"  # log this run under the "opsft" wandb project
+
+
+@dataclass
+class ScriptArguments:
+    # Script-level knobs; everything else is OPSFTConfig, overridable on the CLI or via `--config <yaml>`.
+    model_name: str = "Qwen/Qwen3-4B"
+    eval_size: int = 64  # fixed test subset for eval accuracy (comparable across runs)
+
+
+script_args, training_args = TrlParser((ScriptArguments, OPSFTConfig)).parse_args_and_config()
 
 # GSM8K: `question` is the problem, `answer` is the worked solution ending in "#### <final number>".
 dataset = load_dataset("openai/gsm8k", "main")  # has "train" and "test" splits
@@ -39,31 +51,15 @@ def make_example(example):
 
 dataset = dataset.map(make_example, remove_columns=["question", "answer"])
 
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-4B", attn_implementation="eager")
+model = AutoModelForCausalLM.from_pretrained(script_args.model_name, attn_implementation="eager")
 trainer = OPSFTTrainer(
     model=model,
     # `accuracy_reward` is *not* used by the OPSFT loss; passing it only makes the trainer generate, score, and log
     # `rewards/accuracy_reward/mean` (train) and `eval_rewards/accuracy_reward/mean` (test) every step — i.e. the
     # current accuracy on both splits.
     reward_funcs=accuracy_reward,
-    args=OPSFTConfig(
-        output_dir="checkpoints/Qwen3.5-2B-OPSFT-gsm8k",
-        gradient_checkpointing=False,
-        bf16=True,
-        max_completion_length=512,  # GSM8K chains of thought are long
-        num_generations=8,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
-        eval_strategy="steps",
-        eval_steps=50,
-        logging_steps=1,
-        compute_eval_kl=True,  # log eval_kl vs. the frozen base θ₀ (catastrophic-forgetting probe)
-        # use_vllm=True,  # optional; colocate by default
-        report_to=["wandb"],
-        log_completions=True,
-        num_completions_to_print=1,
-    ),
+    args=training_args,
     train_dataset=dataset["train"],
-    eval_dataset=dataset["test"].select(range(64)),  # fixed 64-sample eval subset (faster, comparable across runs)
+    eval_dataset=dataset["test"].select(range(script_args.eval_size)),
 )
 trainer.train()

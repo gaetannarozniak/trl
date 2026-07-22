@@ -9,18 +9,31 @@ Uses a small model so the double-backward-free jvp forward is cheap; swap the sa
 """
 
 import os
+from dataclasses import dataclass
 
 from datasets import Dataset, load_from_disk
 from transformers import AutoModelForCausalLM
 
+from trl import TrlParser
 from trl.experimental.opsft import OPSFTConfig, OPSFTTrainer
 
 
 os.environ["WANDB_PROJECT"] = "opsft"
 
-MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
-SDFT_DATA = "/home/gaetan/projects/SDFT/data"
-N_COPIES = 1000
+
+@dataclass
+class ScriptArguments:
+    # Script-level knobs; everything else is OPSFTConfig, overridable on the CLI or via `--config <yaml>`.
+    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    sdft_data: str = "/home/gaetan/projects/SDFT/data"
+    n_copies: int = 1000  # times to replicate the single training example
+
+
+script_args, training_args = TrlParser((ScriptArguments, OPSFTConfig)).parse_args_and_config()
+
+MODEL = script_args.model_name
+SDFT_DATA = script_args.sdft_data
+N_COPIES = script_args.n_copies
 
 # Take one science example and turn it into the (x, y) pair OPSFT needs, then replicate it N_COPIES times so every
 # batch is the same example — the model should quickly memorize it.
@@ -34,19 +47,7 @@ train_dataset = Dataset.from_list([example] * N_COPIES)
 model = AutoModelForCausalLM.from_pretrained(MODEL, attn_implementation="eager")
 trainer = OPSFTTrainer(
     model=model,
-    args=OPSFTConfig(
-        output_dir="checkpoints/Qwen2.5-0.5B-OPSFT-toy",
-        gradient_checkpointing=False,
-        bf16=True,
-        max_completion_length=256,
-        num_generations=2,
-        per_device_train_batch_size=8,
-        num_train_epochs=20,
-        logging_steps=1,
-        learning_rate=1e-6,  # OPSFT's F·u step scale is unusual; crank this up if `ref_logp` barely moves
-        eval_strategy="no",
-        report_to=["wandb"],
-    ),
+    args=training_args,
     train_dataset=train_dataset,
 )
 trainer.train()
