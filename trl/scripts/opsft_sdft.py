@@ -2,10 +2,11 @@
 OPSFT on the SDFT science dataset, with live generation-based accuracy eval every `EVAL_EVERY` steps.
 
 Trains on `science_data` (the new skill) and, at each eval, greedily generates with the *current training model*
-(no separate vLLM — that would OOM next to a 7B training job) on two held-out sets:
+(no separate vLLM — that would OOM next to a 7B training job) on three held-out sets:
   - science eval  → new-task accuracy (learning),
-  - tooluse eval  → old-task accuracy (catastrophic forgetting).
-Accuracy definitions are ported verbatim from SDFT's eval_science.py / eval_tooluse.py so the numbers match.
+  - tooluse eval  → old-task accuracy (tool-use forgetting),
+  - gsm8k eval    → old-task accuracy (math forgetting).
+The science/tooluse accuracy definitions are ported verbatim from SDFT's eval_science.py / eval_tooluse.py.
 
 Runs under DDP: eval prompts are sharded across processes and results gathered, so cost scales with #GPUs.
 """
@@ -18,7 +19,7 @@ from dataclasses import dataclass
 
 import torch
 from accelerate.utils import gather_object
-from datasets import load_from_disk
+from datasets import load_dataset, load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 
 from trl import TrlParser
@@ -38,8 +39,10 @@ class ScriptArguments:
     gen_batch_size: int = 8  # generation micro-batch (per process)
     science_eval_size: int | None = 64  # None = all 507
     tooluse_eval_size: int | None = None  # None = all 97
-    science_max_new_tokens: int = 512  # long enough for <reasoning>…</reasoning><answer>…</answer>
-    tooluse_max_new_tokens: int = 512
+    gsm8k_eval_size: int | None = 128  # None = all 1319 GSM8K test; math-capability (forgetting) probe
+    science_max_new_tokens: int = 2048  # long enough for <reasoning>…</reasoning><answer>…</answer>
+    tooluse_max_new_tokens: int = 2048
+    gsm8k_max_new_tokens: int = 2048
 
 
 script_args, training_args = TrlParser((ScriptArguments, OPSFTConfig)).parse_args_and_config()
@@ -50,8 +53,10 @@ EVAL_EVERY = script_args.eval_every
 GEN_BATCH_SIZE = script_args.gen_batch_size
 SCIENCE_EVAL_SIZE = script_args.science_eval_size
 TOOLUSE_EVAL_SIZE = script_args.tooluse_eval_size
+GSM8K_EVAL_SIZE = script_args.gsm8k_eval_size
 SCIENCE_MAX_NEW_TOKENS = script_args.science_max_new_tokens
 TOOLUSE_MAX_NEW_TOKENS = script_args.tooluse_max_new_tokens
+GSM8K_MAX_NEW_TOKENS = script_args.gsm8k_max_new_tokens
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -100,23 +105,47 @@ def score_tooluse(responses, golden_answers):
     return results
 
 
+GSM8K_SYSTEM_PROMPT = "Solve the math problem step by step. End with the final answer on its own line as '#### <number>'."
+
+
+def _extract_gsm8k_number(text):
+    # Number after the last "####" (else the last number in the text), commas/$ stripped.
+    tail = text.split("####")[-1] if "####" in text else text
+    matches = re.findall(r"-?\$?\d[\d,]*(?:\.\d+)?", tail)
+    return matches[-1].replace(",", "").replace("$", "") if matches else None
+
+
+def score_gsm8k(responses, golds):
+    results = []
+    for r, g in zip(responses, golds):
+        pred = _extract_gsm8k_number(r)
+        try:
+            results.append(1 if pred is not None and float(pred) == float(g) else 0)
+        except ValueError:
+            results.append(0)
+    return results
+
+
 # ------------------------------------------------------------------------------------------------------------------
 # Live eval callback
 # ------------------------------------------------------------------------------------------------------------------
 class GenerationEvalCallback(TrainerCallback):
     """Every `EVAL_EVERY` steps (and once before training), generate on both eval sets and log accuracy."""
 
-    def __init__(self, trainer, science_items, tooluse_items):
+    def __init__(self, trainer, science_items, tooluse_items, gsm8k_items):
         self.trainer = trainer
         self.accelerator = trainer.accelerator
         self.tokenizer = trainer.processing_class
-        # Pre-format prompts once: science prompts are chat messages, tooluse prompts are raw strings.
+        # Pre-format prompts once: science/gsm8k prompts are chat messages, tooluse prompts are raw strings.
         self.science_items = [
             {"text": self._render(ex["prompt"]), "gold": ex["answer"]} for ex in science_items
         ]
         self.tooluse_items = [
             {"text": self._render([{"role": "user", "content": ex["prompt"]}]), "gold": ex["golden_answer"]}
             for ex in tooluse_items
+        ]
+        self.gsm8k_items = [
+            {"text": self._render(ex["prompt"]), "gold": ex["answer"]} for ex in gsm8k_items
         ]
 
     def _render(self, messages):
@@ -152,15 +181,25 @@ class GenerationEvalCallback(TrainerCallback):
     def _evaluate_and_log(self, step):
         science_acc = self._run(self.science_items, SCIENCE_MAX_NEW_TOKENS, score_science)
         tooluse_acc = self._run(self.tooluse_items, TOOLUSE_MAX_NEW_TOKENS, score_tooluse)
+        gsm8k_acc = self._run(self.gsm8k_items, GSM8K_MAX_NEW_TOKENS, score_gsm8k)
         if self.accelerator.is_main_process:
-            print(f"[step {step}] science_acc={science_acc:.4f}  tooluse_acc={tooluse_acc:.4f}", flush=True)
+            print(
+                f"[step {step}] science_acc={science_acc:.4f}  tooluse_acc={tooluse_acc:.4f}  "
+                f"gsm8k_acc={gsm8k_acc:.4f}",
+                flush=True,
+            )
             import wandb
 
             # Log against our own `eval/step` axis with NO explicit `step=`: the Trainer free-runs wandb's global step
             # ahead of `global_step`, so an explicit `step=` below wandb's current step is silently dropped.
             if wandb.run is not None:
                 wandb.log(
-                    {"eval/science_accuracy": science_acc, "eval/tooluse_accuracy": tooluse_acc, "eval/step": step}
+                    {
+                        "eval/science_accuracy": science_acc,
+                        "eval/tooluse_accuracy": tooluse_acc,
+                        "eval/gsm8k_accuracy": gsm8k_acc,
+                        "eval/step": step,
+                    }
                 )
 
     def on_train_begin(self, args, state, control, **kwargs):
@@ -221,11 +260,26 @@ tooluse_eval = load_from_disk(f"{SDFT_DATA}/tooluse_data/eval_data")
 if TOOLUSE_EVAL_SIZE is not None:
     tooluse_eval = tooluse_eval.select(range(TOOLUSE_EVAL_SIZE))
 
+# GSM8K math-forgetting probe: prompt with a neutral "#### <number>" instruction and score the final number.
+gsm8k_eval = load_dataset("openai/gsm8k", "main", split="test")
+if GSM8K_EVAL_SIZE is not None:
+    gsm8k_eval = gsm8k_eval.select(range(GSM8K_EVAL_SIZE))
+gsm8k_eval = gsm8k_eval.map(
+    lambda ex: {
+        "prompt": [
+            {"role": "system", "content": GSM8K_SYSTEM_PROMPT},
+            {"role": "user", "content": ex["question"]},
+        ],
+        "answer": ex["answer"].split("####")[-1].strip(),
+    },
+    remove_columns=["question", "answer"],
+)
+
 model = AutoModelForCausalLM.from_pretrained(MODEL, attn_implementation="eager")
 trainer = OPSFTTrainer(
     model=model,
     args=training_args,
     train_dataset=science_train,
 )
-trainer.add_callback(GenerationEvalCallback(trainer, science_eval, tooluse_eval))
+trainer.add_callback(GenerationEvalCallback(trainer, science_eval, tooluse_eval, gsm8k_eval))
 trainer.train()

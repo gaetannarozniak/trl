@@ -24,5 +24,7 @@ eval_every: 50
 gen_batch_size: 8
 science_eval_size: 64
 tooluse_eval_size: null
-science_max_new_tokens: 512
-tooluse_max_new_tokens: 512
+gsm8k_eval_size: 128
+science_max_new_tokens: 2048
+tooluse_max_new_tokens: 2048
+gsm8k_max_new_tokens: 2048
