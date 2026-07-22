@@ -32,6 +32,12 @@ class OPSFTConfig(GRPOConfig):
             self-generated completions. Independent of `beta`: the base model is held and the KL is logged even when
             `beta == 0.0` (no GRPO reference model). Adds one extra model to memory and one extra forward per eval
             step; it is a pure diagnostic and has no effect on training.
+        whitening_probes (`int`, *optional*, defaults to `0`):
+            If `> 0`, diagonally whiten the update: rescale each token coefficient by an estimate of its score norm,
+            $c_t \to c_t / \|\nabla \log f_t\|^2$ (the steepest in-subspace step when the per-token score vectors are
+            orthogonal). The norms are estimated with this many Hutchinson random-tangent JVPs (each an extra
+            forward-mode pass). `0` disables it (plain OPSFT $c$). No damping is applied, so use enough probes to avoid
+            dividing by a noisy small estimate.
     """
 
     compute_eval_kl: bool = field(
@@ -41,5 +47,14 @@ class OPSFTConfig(GRPOConfig):
             "the k3 KL divergence (`eval_kl`) between the trained policy and the base model over the model's "
             "self-generated completions. Independent of `beta`: logged even when `beta == 0.0`. Adds one extra model "
             "to memory and one extra forward per eval step; it is a pure diagnostic and has no effect on training."
+        },
+    )
+    whitening_probes: int = field(
+        default=0,
+        metadata={
+            "help": "If > 0, diagonally whiten the update: rescale each token coefficient by an estimate of its score "
+            "norm, c_t -> c_t / ||grad log f_t||^2 (steepest in-subspace step when the per-token score vectors are "
+            "orthogonal). The norms are estimated with this many Hutchinson random-tangent JVPs (each an extra "
+            "forward-mode pass). 0 disables it (plain OPSFT c). No damping is applied."
         },
     )

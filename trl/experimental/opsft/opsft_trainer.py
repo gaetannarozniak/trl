@@ -104,6 +104,8 @@ class OPSFTTrainer(_GRPOTrainer):
         super().__init__(model=model, reward_funcs=reward_funcs, args=args, **kwargs)
         # Snapshot of the initial parameters θ₀ (captured lazily on the first `_compute_loss` call) to log drift.
         self._theta0 = None
+        # Diagonal whitening: 0 = plain OPSFT c; >0 = rescale c_t by an m-probe estimate of ‖∇log f_t‖² (see step 4).
+        self.whitening_probes = args.whitening_probes
         # Eval-only KL diagnostic: hold a frozen base model θ₀ and log KL(policy ‖ base) at eval (see `_log_eval_kl`).
         self.compute_eval_kl = args.compute_eval_kl
         if self.compute_eval_kl and args.beta != 0.0:
@@ -167,6 +169,19 @@ class OPSFTTrainer(_GRPOTrainer):
 
         _, c = torch.func.jvp(logps_of_params, tuple(params), tuple(u))
         return c.detach()  # (T,) = J u
+
+    def _diag_whiten(self, c, model, param_names, params, input_ids, attention_mask, logits_to_keep, mask):
+        # Diagonally whiten c: return c_t / ‖∇log f_t‖², the steepest in-subspace step when the per-token score vectors
+        # are orthogonal (so JJ^T = diag(‖∇log f_t‖²)). J is never materialized: diag(JJ^T)_t = ‖∇log f_t‖² is estimated
+        # by Hutchinson — E_v[(J v)_t²] = ‖∇log f_t‖² for random ±1 v — averaging `whitening_probes` random-tangent
+        # JVPs (each one extra forward-mode pass). No damping (see `whitening_probes` in the config).
+        diag = torch.zeros_like(c)
+        for _ in range(self.whitening_probes):
+            v = [(torch.randint(0, 2, p.shape, device=p.device) * 2 - 1).to(p.dtype) for p in params]  # Rademacher ±1
+            jv = self._compute_c_torch_jvp(model, param_names, params, v, input_ids, attention_mask, logits_to_keep, mask)
+            diag += jv * jv
+        diag /= self.whitening_probes
+        return c / diag
 
     def _log_peak_memory(self, mode):
         # Peak CUDA memory allocated during this `_compute_loss` call (the tracker is reset at its start), so the two
@@ -291,10 +306,15 @@ class OPSFTTrainer(_GRPOTrainer):
         u = [torch.zeros_like(p) if g is None else g.detach() for p, g in zip(params, u)]
 
         # 4. c = J u: the directional derivative of each log f_t along u, i.e. c_t = grad log f_t . u, computed with
-        # forward-mode autodiff (see `_compute_c_torch_jvp`).
+        # forward-mode autodiff (see `_compute_c_torch_jvp`). When `whitening_probes > 0`, diagonally whiten it to
+        # c_t / ‖∇log f_t‖² (see `_diag_whiten`).
         c = self._compute_c_torch_jvp(
             unwrapped_model, param_names, params, u, input_ids, attention_mask, logits_to_keep, mask
         )
+        if self.whitening_probes:
+            c = self._diag_whiten(
+                c, unwrapped_model, param_names, params, input_ids, attention_mask, logits_to_keep, mask
+            )
 
         # 5. Surrogate loss whose gradient is S = J^T c = F u. `c` is detached, so backprop only flows through logps;
         # the step-1 forward graph is kept alive for this backward. Normalized by the number of generated tokens (mean)
