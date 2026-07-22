@@ -107,6 +107,7 @@ class OPSFTTrainer(_GRPOTrainer):
         # Diagonal whitening: 0 = plain OPSFT c; >0 = rescale c_t by an m-probe estimate of ‖∇log f_t‖² (see step 4).
         self.whitening_probes = args.whitening_probes
         self.whitening_damping = args.whitening_damping  # relative damping λ (fraction of mean estimated norm)
+        self.sft_baseline = args.sft_baseline  # train on the plain SFT gradient u instead of the OPSFT step J^T c
         # Eval-only KL diagnostic: hold a frozen base model θ₀ and log KL(policy ‖ base) at eval (see `_log_eval_kl`).
         self.compute_eval_kl = args.compute_eval_kl
         if self.compute_eval_kl and args.beta != 0.0:
@@ -225,10 +226,31 @@ class OPSFTTrainer(_GRPOTrainer):
         output["ref_completion_mask"] = pad([torch.ones_like(x) for x in ref_completion_ids], 0, "right").to(device)
         return output
 
+    def _sft_baseline_loss(self, model, inputs):
+        # Plain-SFT baseline: step in the SFT direction u = ∇log π(y|x) instead of the OPSFT step J^T c. Minimize the
+        # reference NLL through the *wrapped* model so DDP all-reduces the gradient (a standard SFT step) — no JVP,
+        # whitening, or generated forward. The self-generated rollout still ran upstream (kept identical for
+        # comparison) but is unused here.
+        ref_completion_mask = inputs["ref_completion_mask"]
+        ref_input_ids = torch.cat([inputs["ref_prompt_ids"], inputs["ref_completion_ids"]], dim=1)
+        ref_attention_mask = torch.cat([inputs["ref_prompt_mask"], ref_completion_mask], dim=1)
+        ref_logits_to_keep = inputs["ref_completion_ids"].size(1)
+        sft_logps, _, _ = self._get_per_token_logps_and_entropies(
+            model, ref_input_ids, ref_attention_mask, ref_logits_to_keep, compute_entropy=False, compute_aux_loss=False
+        )
+        token_count = ref_completion_mask.sum().clamp(min=1.0)
+        ref_logp_mean = (sft_logps * ref_completion_mask).sum().detach() / token_count
+        self._metrics["train"]["ref_logp"].append(self.accelerator.gather(ref_logp_mean).nanmean().item())
+        return -(sft_logps * ref_completion_mask).sum() / token_count / self.current_gradient_accumulation_steps
+
     def _compute_loss(self, model, inputs):
         # Reset the CUDA peak tracker so `_log_peak_memory` reports the peak of *this* call (double-backward vs jvp).
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
+
+        # Plain-SFT baseline (train only): step in the reference gradient u instead of the OPSFT step (see method).
+        if self.sft_baseline and self.model.training:
+            return self._sft_baseline_loss(model, inputs)
 
         # 1. Per-token log f_t = log pi(y_t | x, y_<t) of the self-generated completion. Reuse GRPO's helper (same
         # call as GRPOTrainer._compute_loss), but we need neither entropy nor the MoE aux loss here.

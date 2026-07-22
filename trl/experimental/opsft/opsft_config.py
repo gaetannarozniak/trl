@@ -42,6 +42,10 @@ class OPSFTConfig(GRPOConfig):
             $\lambda = \texttt{whitening\_damping}\cdot\operatorname{mean}_t\|\nabla\log f_t\|^2$. Keeps tiny/noisy
             estimates from blowing up the coefficient while barely biasing typical tokens; only used when
             `whitening_probes > 0`. Set `0.0` for the pure (numerically unstable) version.
+        sft_baseline (`bool`, *optional*, defaults to `False`):
+            If `True`, train with the plain SFT gradient $u = \nabla\log\pi(y\mid x)$ (minimize the reference NLL)
+            instead of the OPSFT step $J^\top c$ — a controlled baseline sharing the same rollout/eval pipeline. The
+            self-generated rollout still runs upstream but is unused by the loss.
     """
 
     compute_eval_kl: bool = field(
@@ -68,5 +72,13 @@ class OPSFTConfig(GRPOConfig):
             "help": "Relative damping lambda for the whitening, as a fraction of the mean estimated norm "
             "(lambda = whitening_damping * mean_t ||grad log f_t||^2). Tames tiny/noisy estimates without biasing "
             "typical tokens; only used when whitening_probes > 0. Set 0.0 for the pure (unstable) version."
+        },
+    )
+    sft_baseline: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, train with the plain SFT gradient u = grad log pi(y|x) (minimize the reference NLL) "
+            "instead of the OPSFT step J^T c. A controlled baseline sharing the same rollout/eval pipeline; the "
+            "generated rollout still runs upstream but is unused by the loss."
         },
     )
