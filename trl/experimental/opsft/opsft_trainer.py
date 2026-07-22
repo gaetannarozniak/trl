@@ -106,6 +106,7 @@ class OPSFTTrainer(_GRPOTrainer):
         self._theta0 = None
         # Diagonal whitening: 0 = plain OPSFT c; >0 = rescale c_t by an m-probe estimate of ‖∇log f_t‖² (see step 4).
         self.whitening_probes = args.whitening_probes
+        self.whitening_damping = args.whitening_damping  # relative damping λ (fraction of mean estimated norm)
         # Eval-only KL diagnostic: hold a frozen base model θ₀ and log KL(policy ‖ base) at eval (see `_log_eval_kl`).
         self.compute_eval_kl = args.compute_eval_kl
         if self.compute_eval_kl and args.beta != 0.0:
@@ -171,16 +172,21 @@ class OPSFTTrainer(_GRPOTrainer):
         return c.detach()  # (T,) = J u
 
     def _diag_whiten(self, c, model, param_names, params, input_ids, attention_mask, logits_to_keep, mask):
-        # Diagonally whiten c: return c_t / ‖∇log f_t‖², the steepest in-subspace step when the per-token score vectors
-        # are orthogonal (so JJ^T = diag(‖∇log f_t‖²)). J is never materialized: diag(JJ^T)_t = ‖∇log f_t‖² is estimated
-        # by Hutchinson — E_v[(J v)_t²] = ‖∇log f_t‖² for random ±1 v — averaging `whitening_probes` random-tangent
-        # JVPs (each one extra forward-mode pass). No damping (see `whitening_probes` in the config).
+        # Diagonally whiten c: return c_t / (‖∇log f_t‖² + λ), the steepest in-subspace step when the per-token score
+        # vectors are orthogonal (so JJ^T = diag(‖∇log f_t‖²)). J is never materialized: diag(JJ^T)_t = ‖∇log f_t‖² is
+        # estimated by Hutchinson — E_v[(J v)_t²] = ‖∇log f_t‖² for random ±1 v — averaging `whitening_probes`
+        # random-tangent JVPs (each one extra forward-mode pass). λ = `whitening_damping` × mean(diag) is a small
+        # relative damping that keeps tiny/noisy estimates from blowing up the coefficient (see the config).
         diag = torch.zeros_like(c)
         for _ in range(self.whitening_probes):
             v = [(torch.randint(0, 2, p.shape, device=p.device) * 2 - 1).to(p.dtype) for p in params]  # Rademacher ±1
             jv = self._compute_c_torch_jvp(model, param_names, params, v, input_ids, attention_mask, logits_to_keep, mask)
             diag += jv * jv
+            del v, jv  # free the param-sized tangent + its forward before the next probe
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()  # reclaim fragmentation between probes
         diag /= self.whitening_probes
+        diag = diag + self.whitening_damping * diag.mean()
         return c / diag
 
     def _log_peak_memory(self, mode):
@@ -312,6 +318,7 @@ class OPSFTTrainer(_GRPOTrainer):
             unwrapped_model, param_names, params, u, input_ids, attention_mask, logits_to_keep, mask
         )
         if self.whitening_probes:
+            del u  # free the param-sized SFT direction before the whitening JVPs (each needs its own tangent)
             c = self._diag_whiten(
                 c, unwrapped_model, param_names, params, input_ids, attention_mask, logits_to_keep, mask
             )
