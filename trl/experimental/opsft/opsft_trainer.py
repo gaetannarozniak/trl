@@ -183,8 +183,6 @@ class OPSFTTrainer(_GRPOTrainer):
             jv = self._compute_c_torch_jvp(model, param_names, params, v, input_ids, attention_mask, logits_to_keep, mask)
             diag += jv * jv
             del v, jv  # free the param-sized tangent + its forward before the next probe
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()  # reclaim fragmentation between probes
         diag /= self.whitening_probes
         diag = diag + self.whitening_damping * diag.mean()
         return c / diag
@@ -310,18 +308,28 @@ class OPSFTTrainer(_GRPOTrainer):
         ref_token_count = ref_completion_mask.sum().clamp(min=1.0)
         u = torch.autograd.grad(ref_logp / ref_token_count, params, allow_unused=True)
         u = [torch.zeros_like(p) if g is None else g.detach() for p, g in zip(params, u)]
+        u_norm = torch.sqrt(sum((up * up).sum() for up in u))  # ‖u‖ (for the grad-alignment metric)
 
-        # 4. c = J u: the directional derivative of each log f_t along u, i.e. c_t = grad log f_t . u, computed with
-        # forward-mode autodiff (see `_compute_c_torch_jvp`). When `whitening_probes > 0`, diagonally whiten it to
-        # c_t / ‖∇log f_t‖² (see `_diag_whiten`).
-        c = self._compute_c_torch_jvp(
+        # 4. c = J u (see `_compute_c_torch_jvp`). `c_raw` is the raw directional derivatives; when `whitening_probes`
+        # > 0 the coefficient `c` is the diagonally-whitened `c_raw` (see `_diag_whiten`).
+        c_raw = self._compute_c_torch_jvp(
             unwrapped_model, param_names, params, u, input_ids, attention_mask, logits_to_keep, mask
         )
+        del u  # u is unused past the JVP; free it before the whitening probes / alignment backward
         if self.whitening_probes:
-            del u  # free the param-sized SFT direction before the whitening JVPs (each needs its own tangent)
             c = self._diag_whiten(
-                c, unwrapped_model, param_names, params, input_ids, attention_mask, logits_to_keep, mask
+                c_raw, unwrapped_model, param_names, params, input_ids, attention_mask, logits_to_keep, mask
             )
+        else:
+            c = c_raw
+
+        # Angle between the SFT gradient u = ∇log π(y|x) and the update direction S = J^T c: cos = <u,S>/(‖u‖‖S‖).
+        # <u,S> = (J u)·c = c_raw·c is free; ‖S‖ = ‖J^T c‖ needs one extra (local) backward of the surrogate.
+        grad_s = torch.autograd.grad((c * logps).sum(), params, retain_graph=True, allow_unused=True)
+        s_norm = torch.sqrt(sum((g * g).sum() for g in grad_s if g is not None))
+        cos = (c_raw * c).sum() / (u_norm * s_norm).clamp(min=1e-12)
+        self._metrics[mode]["grad_alignment_cos"].append(self.accelerator.gather(cos).nanmean().item())
+        del grad_s
 
         # 5. Surrogate loss whose gradient is S = J^T c = F u. `c` is detached, so backprop only flows through logps;
         # the step-1 forward graph is kept alive for this backward. Normalized by the number of generated tokens (mean)
