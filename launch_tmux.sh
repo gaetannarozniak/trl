@@ -43,6 +43,13 @@ fi
 # tmux session / log file names: alphanumerics only (spaces, dots, dashes, slashes -> underscore).
 SAFE_NAME=$(printf '%s' "$JOB_NAME" | tr -c 'A-Za-z0-9' '_' | tr -s '_' | sed 's/^_//; s/_$//')
 
+# The dev QOS caps wall time at 24h; every other QOS gets the full 96h.
+if [ "$QOS" = "h200_dev" ]; then
+    TIME_LIMIT="24:00:00"
+else
+    TIME_LIMIT="96:00:00"
+fi
+
 mkdir -p "$LOG_DIR"
 export JOB_NAME SAFE_NAME CMD REPO_DIR LOG_DIR
 
@@ -54,7 +61,7 @@ srun \
     --gpus=8 \
     --mem=1024G \
     --cpus-per-task=128 \
-    --time=96:00:00 \
+    --time="$TIME_LIMIT" \
     bash -c '
         SESSION="$SAFE_NAME"
         LOG="$LOG_DIR/${SAFE_NAME}_${SLURM_JOB_ID}.out"
