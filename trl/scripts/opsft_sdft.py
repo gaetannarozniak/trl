@@ -43,6 +43,7 @@ class ScriptArguments:
     science_max_new_tokens: int = 2048  # long enough for <reasoning>…</reasoning><answer>…</answer>
     tooluse_max_new_tokens: int = 2048
     gsm8k_max_new_tokens: int = 2048
+    base_kl: bool = True  # log eval/base_kl = k3 KL(current ‖ base θ₀); reloads the base from disk each eval
 
 
 script_args, training_args = TrlParser((ScriptArguments, OPSFTConfig)).parse_args_and_config()
@@ -57,6 +58,7 @@ GSM8K_EVAL_SIZE = script_args.gsm8k_eval_size
 SCIENCE_MAX_NEW_TOKENS = script_args.science_max_new_tokens
 TOOLUSE_MAX_NEW_TOKENS = script_args.tooluse_max_new_tokens
 GSM8K_MAX_NEW_TOKENS = script_args.gsm8k_max_new_tokens
+BASE_KL = script_args.base_kl
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -178,29 +180,81 @@ class GenerationEvalCallback(TrainerCallback):
         scores = score_fn([g["response"] for g in gathered], [g["gold"] for g in gathered])
         return sum(scores) / max(len(scores), 1)
 
+    @torch.no_grad()
+    def _token_logps(self, model, input_ids, attention_mask, comp_ids):
+        # Teacher-forced per-token log-probs of the completion tokens under `model`. logits_to_keep+1 then drop the
+        # last position, mirroring OPSFTTrainer._get_per_token_logps_and_entropies, so we keep the logits that
+        # *predict* each completion token.
+        logits_to_keep = comp_ids.shape[1]
+        logits = model(
+            input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1, use_cache=False
+        ).logits
+        logits = logits[:, :-1, :][:, -logits_to_keep:, :]
+        return torch.log_softmax(logits, dim=-1).gather(-1, comp_ids.unsqueeze(-1)).squeeze(-1)
+
+    @torch.no_grad()
+    def _base_kl(self):
+        # k3 KL(current ‖ base θ₀) over the current model's greedy completions on the science prompts. The base is
+        # reloaded from disk each eval (so it never occupies GPU memory during the training step / double-backward),
+        # forwarded alongside the current model on prompt+completion, and the per-token estimator is averaged.
+        tok = self.tokenizer
+        pad_id = tok.pad_token_id
+        base = AutoModelForCausalLM.from_pretrained(MODEL).to(self.accelerator.device)
+        base.eval()
+        original_side = tok.padding_side
+        tok.padding_side = "left"
+        local = []
+        with self.accelerator.split_between_processes(self.science_items) as shard:
+            with unwrap_model_for_generation(self.trainer.model_wrapped, self.accelerator) as cur:
+                cur.eval()
+                for i in range(0, len(shard), GEN_BATCH_SIZE):
+                    texts = [it["text"] for it in shard[i : i + GEN_BATCH_SIZE]]
+                    enc = tok(texts, return_tensors="pt", padding=True, add_special_tokens=False).to(
+                        self.accelerator.device
+                    )
+                    gen = cur.generate(
+                        **enc, max_new_tokens=SCIENCE_MAX_NEW_TOKENS, do_sample=False, pad_token_id=pad_id
+                    )
+                    comp_ids = gen[:, enc["input_ids"].shape[1] :]
+                    comp_mask = (comp_ids != pad_id).float()
+                    attn = torch.cat([enc["attention_mask"], (comp_ids != pad_id).long()], dim=1)
+                    delta = self._token_logps(base, gen, attn, comp_ids) - self._token_logps(cur, gen, attn, comp_ids)
+                    k3 = torch.exp(delta) - delta - 1  # k3 estimator of KL(current ‖ base), per token
+                    per_seq = (k3 * comp_mask).sum(-1) / comp_mask.sum(-1).clamp(min=1.0)
+                    local.extend(per_seq.tolist())
+                cur.train()
+        tok.padding_side = original_side
+        del base
+        gathered = gather_object(local)
+        return sum(gathered) / max(len(gathered), 1)
+
     def _evaluate_and_log(self, step):
         science_acc = self._run(self.science_items, SCIENCE_MAX_NEW_TOKENS, score_science)
         tooluse_acc = self._run(self.tooluse_items, TOOLUSE_MAX_NEW_TOKENS, score_tooluse)
         gsm8k_acc = self._run(self.gsm8k_items, GSM8K_MAX_NEW_TOKENS, score_gsm8k)
+        base_kl = self._base_kl() if BASE_KL else None
         if self.accelerator.is_main_process:
-            print(
+            line = (
                 f"[step {step}] science_acc={science_acc:.4f}  tooluse_acc={tooluse_acc:.4f}  "
-                f"gsm8k_acc={gsm8k_acc:.4f}",
-                flush=True,
+                f"gsm8k_acc={gsm8k_acc:.4f}"
             )
+            if base_kl is not None:
+                line += f"  base_kl={base_kl:.4f}"
+            print(line, flush=True)
             import wandb
 
             # Log against our own `eval/step` axis with NO explicit `step=`: the Trainer free-runs wandb's global step
             # ahead of `global_step`, so an explicit `step=` below wandb's current step is silently dropped.
             if wandb.run is not None:
-                wandb.log(
-                    {
-                        "eval/science_accuracy": science_acc,
-                        "eval/tooluse_accuracy": tooluse_acc,
-                        "eval/gsm8k_accuracy": gsm8k_acc,
-                        "eval/step": step,
-                    }
-                )
+                logs = {
+                    "eval/science_accuracy": science_acc,
+                    "eval/tooluse_accuracy": tooluse_acc,
+                    "eval/gsm8k_accuracy": gsm8k_acc,
+                    "eval/step": step,
+                }
+                if base_kl is not None:
+                    logs["eval/base_kl"] = base_kl
+                wandb.log(logs)
 
     def on_train_begin(self, args, state, control, **kwargs):
         if self.accelerator.is_main_process:

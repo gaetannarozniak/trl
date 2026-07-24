@@ -28,3 +28,4 @@ gsm8k_eval_size: 128
 science_max_new_tokens: 2048
 tooluse_max_new_tokens: 2048
 gsm8k_max_new_tokens: 2048
+base_kl: true                  # true = log eval/base_kl = k3 KL(current ‖ base θ₀); reloads the base each eval (~5–30s)
