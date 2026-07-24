@@ -66,9 +66,13 @@ srun \
         SESSION="$SAFE_NAME"
         LOG="$LOG_DIR/${SAFE_NAME}_${SLURM_JOB_ID}.out"
         export TERM=xterm-256color  # headless tmux needs TERM + explicit dimensions
+        # Keep the HF *datasets* cache on node-local disk (job-scoped): its FileLock races on NFS across the 8 ranks
+        # and throws OSError [Errno 116] Stale file handle. Local flock only returns EAGAIN/EWOULDBLOCK (retried),
+        # never ESTALE, so the ranks serialize cleanly. Only the datasets cache is moved (not HF_HOME), so the model
+        # weights are still read from the warm NFS cache.
         # One window: activate the venv, run the command, tee to the log, then kill the session so the poll loop exits.
         tmux new-session -d -s "$SESSION" -n "train" -x 220 -y 50 \
-            "cd \"$REPO_DIR\" && source .venv/bin/activate && $CMD 2>&1 | tee \"$LOG\"; tmux kill-session -t \"$SESSION\""
+            "cd \"$REPO_DIR\" && source .venv/bin/activate && export HF_DATASETS_CACHE=/tmp/hf_datasets_$SLURM_JOB_ID && $CMD 2>&1 | tee \"$LOG\"; tmux kill-session -t \"$SESSION\""
         # Keep srun alive until the tmux session ends (i.e. training finishes) so the node is released.
         while tmux has-session -t "$SESSION" 2>/dev/null; do sleep 10; done
     ' &
