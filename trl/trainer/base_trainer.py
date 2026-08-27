@@ -40,6 +40,7 @@ _TELEMETRY_TRAINERS = {
     "KTOTrainer",
     "RewardTrainer",
     "RLOOTrainer",
+    "OPSFTTrainer",
     "SFTTrainer",
     # Experimental
     "A2POTrainer",

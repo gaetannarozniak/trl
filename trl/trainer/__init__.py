@@ -38,6 +38,8 @@ _import_structure = {
     "reward_trainer": ["RewardTrainer"],
     "rloo_config": ["RLOOConfig"],
     "rloo_trainer": ["RLOOTrainer"],
+    "opsft_config": ["OPSFTConfig"],
+    "opsft_trainer": ["OPSFTTrainer"],
     "sft_config": ["SFTConfig"],
     "sft_trainer": ["SFTTrainer"],
     "utils": [
@@ -70,6 +72,8 @@ if TYPE_CHECKING:
     from .reward_trainer import RewardTrainer
     from .rloo_config import RLOOConfig
     from .rloo_trainer import RLOOTrainer
+    from .opsft_config import OPSFTConfig
+    from .opsft_trainer import OPSFTTrainer
     from .sft_config import SFTConfig
     from .sft_trainer import SFTTrainer
     from .utils import (
