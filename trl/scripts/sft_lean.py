@@ -263,8 +263,9 @@ if cli.learning_rate is not None:
 
 if cli.trainer == "opsft":
     # max_completion_length bounds generation; max_length (above) bounds the teacher-forced pass.
-    # num_generations must divide the effective batch.
-    config = OPSFTConfig(**common, max_completion_length=1024, num_generations=2)
+    # One generation per prompt: the OPSFT advantages come from the SFT target gradient, not from a
+    # group baseline, so a group of 1 is fine and halves the generation cost per prompt.
+    config = OPSFTConfig(**common, max_completion_length=1024, num_generations=1)
 else:
     config = SFTConfig(**common)
 

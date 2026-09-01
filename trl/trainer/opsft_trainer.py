@@ -1697,7 +1697,7 @@ class OPSFTTrainer(_BaseTrainer):
         mean_grouped_rewards = torch.nanmean(grouped_rewards, dim=1)
         if num_generations > 1:
             std_rewards = nanstd(grouped_rewards, dim=1)
-        else:  # doesn't occur during training, but could occur in eval when num_generations_eval=1
+        else:  # a group of one has no spread; the logged reward_std is then meaningless
             std_rewards = torch.zeros_like(mean_grouped_rewards)
 
         # OPSFT advantages computation. The leave-one-out baseline averages over scorable siblings only: nansum drops
@@ -1709,7 +1709,7 @@ class OPSFTTrainer(_BaseTrainer):
             baselines = (grouped_sum - grouped_rewards) / (scorable_counts - 1)  # (num_prompts, num_generations)
             baselines = baselines.view(-1)  # Flatten back to match rewards shape
             advantages = rewards - baselines
-        else:  # this case doesn't occur during training, but could in eval when num_generations_eval=1
+        else:  # no sibling to build a baseline from; these advantages are overwritten by the OPSFT ones anyway
             advantages = torch.zeros_like(rewards)
 
         # Normalize advantages over the scorable subset only (unscorable advantages are still NaN here).

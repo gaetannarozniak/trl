@@ -57,7 +57,8 @@ class OPSFTConfig(_BaseConfig):
             requires any column other than `"prompts"` and `"completions"`, you should keep this to `False`.
         num_generations (`int`, *optional*, defaults to `2`):
             Number of generations per prompt to sample. The effective batch size (num_processes * per_device_batch_size
-            * gradient_accumulation_steps) must be evenly divisible by this value.
+            * gradient_accumulation_steps) must be evenly divisible by this value. Unlike RLOO, `1` is allowed: OPSFT
+            builds its advantages from the SFT target gradient, not from a group baseline.
         num_generations_eval (`int` or `None`, *optional*):
             Number of generations to sample during evaluation. This allows using fewer generations during evaluation to
             save computation. If `None`, uses the value of `num_generations`.
@@ -697,10 +698,4 @@ class OPSFTConfig(_BaseConfig):
             raise ValueError(
                 f"generation_batch_size ({self.generation_batch_size}) must be divisible by num_generations "
                 f"({self.num_generations})."
-            )
-
-        if self.num_generations < 2:
-            raise ValueError(
-                "OPSFT requires at least 2 generations per prompt to calculate the advantages. You provided "
-                f"{self.num_generations}, which is less than the minimum required."
             )
