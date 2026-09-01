@@ -14,6 +14,7 @@
 
 import asyncio
 import atexit
+import contextlib
 import copy
 import inspect
 import math
@@ -27,6 +28,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as dist
 import torch.utils.data
 import transformers
 from accelerate.logging import get_logger
@@ -34,6 +36,7 @@ from accelerate.utils import gather, gather_object, is_peft_model, set_seed
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
 from packaging.version import Version
 from torch import nn
+from torch.func import functional_call, jvp
 from torch.utils.data import DataLoader, Sampler
 from transformers import (
     AutoModelForSequenceClassification,
@@ -67,8 +70,6 @@ from .utils import (
     get_callable_name,
     get_config_model_id,
     identity,
-    nanmax,
-    nanmin,
     nanstd,
     pad,
     print_prompt_completions_sample,
@@ -491,6 +492,7 @@ class OPSFTTrainer(_BaseTrainer):
 
         # Training arguments
         self.max_completion_length = args.max_completion_length
+        self.max_length = args.max_length
         self.num_generations = args.num_generations
         self.num_generations_eval = args.num_generations_eval or self.num_generations
         self.chat_template_kwargs = args.chat_template_kwargs or {}
@@ -1009,6 +1011,98 @@ class OPSFTTrainer(_BaseTrainer):
             self._current_train_step_time = 0.0
         return output
 
+    @contextlib.contextmanager
+    def _functorch_safe(self, base):
+        """Disable the training machinery that forward-mode AD cannot trace.
+
+        All three exist only to serve a backward pass, which `jvp` never runs: SDPA has no
+        forward-AD rule, `make_inputs_require_grads` calls `requires_grad_()`, and gradient
+        checkpointing installs saved-tensor hooks. The last two raise inside any `torch.func`
+        transform.
+        """
+        prev = base.config._attn_implementation
+        base.config._attn_implementation = "eager"
+        # The bookkeeping attribute from enable_input_require_grads() lives on whichever wrapper the
+        # method was called on -- not necessarily `base` -- so strip the hook by name instead.
+        stripped = []
+        for mod in base.modules():
+            for hid, h in list(getattr(mod, "_forward_hooks", {}).items()):
+                if getattr(h, "__name__", "") == "make_inputs_require_grads":
+                    stripped.append((mod, hid, h))
+                    del mod._forward_hooks[hid]
+        # Flip the flag rather than calling gradient_checkpointing_disable(), which would rebuild
+        # _gradient_checkpointing_func and could change use_reentrant on restore.
+        gc_mods = [m for m in base.modules() if getattr(m, "gradient_checkpointing", False)]
+        for m in gc_mods:
+            m.gradient_checkpointing = False
+        try:
+            yield
+        finally:
+            base.config._attn_implementation = prev
+            for mod, hid, h in stripped:
+                mod._forward_hooks[hid] = h
+            for m in gc_mods:
+                m.gradient_checkpointing = True
+
+    def compute_sft_gradient(self, rows: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        """Gradient of the SFT loss on the dataset's gold completions, at the current weights.
+
+        This is the direction the OPSFT advantages project onto. It is taken with
+        `torch.autograd.grad(loss, params)` rather than `loss.backward()`: passing the parameters as
+        explicit `inputs` skips their AccumulateGrad nodes, so `.grad` is never written and
+        DeepSpeed's gradient-reduction hooks never fire. Unlike `torch.func.grad` it also tolerates
+        gradient checkpointing, which is what keeps the activation graph affordable here. The
+        returned tensors own compact storages; a gradient read back from `.grad` would be a view
+        into DeepSpeed's flat buffer, which makes `make_dual` allocate a full-model tangent per
+        parameter.
+        """
+        base = self.accelerator.unwrap_model(self.model)
+        device = self.accelerator.device
+        pad = self._tokenizer.pad_token_id
+
+        prompt_ids = self.processing_class(text=[r["prompt"] for r in rows])["input_ids"]
+        completion_ids = self.processing_class(
+            text=[r["completion"] for r in rows], add_special_tokens=False
+        )["input_ids"]
+
+        # Cap the total sequence: the logits below are upcast to float32 by ForCausalLMLoss, so one
+        # long row would otherwise size the whole padded batch. Prompts are short, so trim the
+        # completion rather than the sequence, which keeps every row with something to supervise.
+        completion_ids = [c[: max(self.max_length - len(p), 0)] for p, c in zip(prompt_ids, completion_ids)]
+
+        seq_len = max(len(p) + len(c) for p, c in zip(prompt_ids, completion_ids))
+        input_ids = torch.full((len(rows), seq_len), pad, dtype=torch.long, device=device)
+        attention_mask = torch.zeros((len(rows), seq_len), dtype=torch.long, device=device)
+        labels = torch.full((len(rows), seq_len), -100, dtype=torch.long, device=device)
+        for i, (p, c) in enumerate(zip(prompt_ids, completion_ids)):
+            input_ids[i, : len(p) + len(c)] = torch.tensor(p + c, device=device)
+            attention_mask[i, : len(p) + len(c)] = 1
+            labels[i, len(p) : len(p) + len(c)] = torch.tensor(c, device=device)  # completion only
+
+        names = [n for n, p in base.named_parameters() if p.requires_grad]
+        plist = [p for _, p in base.named_parameters() if p.requires_grad]
+        loss = base(
+            input_ids=input_ids, attention_mask=attention_mask, labels=labels, use_cache=False
+        ).loss
+        target_gradient = dict(zip(names, torch.autograd.grad(loss, plist)))
+        mode = "train" if self.model.training else "eval"
+        self._metrics[mode]["sft_loss"].append(
+            self.accelerator.gather_for_metrics(loss.detach()).mean().item()
+        )
+        del loss
+        # The JVP tangent must be the same pytree as its primals, which cover every parameter.
+        target_gradient.update(
+            {n: torch.zeros_like(p) for n, p in base.named_parameters() if not p.requires_grad}
+        )
+
+        # Every rank holds a different slice of the batch, so average to give them all the same
+        # global SFT direction to project onto.
+        if self.accelerator.num_processes > 1:
+            for v in target_gradient.values():
+                dist.all_reduce(v)
+                v /= self.accelerator.num_processes
+        return target_gradient
+
     @profiling_decorator
     def _prepare_inputs(self, generation_batch: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
         # Prepares inputs for model training/evaluation by managing completion generation and batch handling.
@@ -1029,7 +1123,25 @@ class OPSFTTrainer(_BaseTrainer):
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self._step % generate_every == 0 or self._buffered_inputs is None:
                 # self._buffered_inputs=None can occur when resuming from a checkpoint
+                # `generation_batch` is a list[dict] of raw rows here and a tensor dict after the
+                # call below, so keep the rows: the SFT target gradient needs the gold completions.
+                rows = generation_batch
                 generation_batch = self._generate_and_score_completions(generation_batch)
+
+                # Here rather than in the loss, so the weight-sized target gradient is freed before
+                # the training backward allocates its activation graph.
+                input_ids = torch.cat(
+                    [generation_batch["prompt_ids"], generation_batch["completion_ids"]], dim=1
+                )
+                attention_mask = torch.cat(
+                    [generation_batch["prompt_mask"], generation_batch["completion_mask"]], dim=1
+                )
+                target_gradient = self.compute_sft_gradient(rows)
+                generation_batch["advantages"] = self._compute_opsft_advantages(
+                    target_gradient, input_ids, attention_mask, generation_batch["completion_ids"].size(1)
+                )
+                del target_gradient, rows
+
                 generation_batch = split_pixel_values_by_grid(generation_batch)
                 generation_batch = shuffle_sequence_dict(generation_batch)
                 generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
@@ -1039,6 +1151,8 @@ class OPSFTTrainer(_BaseTrainer):
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
             # local generation batch == local eval batch
             inputs = self._generate_and_score_completions(generation_batch)
+            # Skip the JVP during eval; zeros keep `_compute_loss` shape-compatible.
+            inputs["advantages"] = torch.zeros_like(inputs["completion_mask"], dtype=torch.float32)
         return inputs
 
     def _log_completion_extra(self, column: str, values: list):
@@ -1691,6 +1805,33 @@ class OPSFTTrainer(_BaseTrainer):
                 output["num_tiles"] = num_tiles
         return output
 
+    def _compute_opsft_advantages(self, target_gradient, input_ids, attention_mask, logits_to_keep):
+        base = self.accelerator.unwrap_model(self.model)
+        # .clone(), not just .detach(): DeepSpeed's parameters are views into one flat buffer, and
+        # make_dual sizes a tangent to the primal's *whole storage*, so views cost a full-model
+        # tangent each. Cloning gives every parameter a compact storage and the tangent is aliased.
+        params = {k: v.detach().clone() for k, v in base.named_parameters()}
+        completion_ids = input_ids[:, -logits_to_keep:]
+
+        def f(p):
+            logits = functional_call(
+                base,
+                p,
+                kwargs=dict(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    logits_to_keep=logits_to_keep + 1,
+                ),
+            ).logits[:, :-1, :][:, -logits_to_keep:, :]
+            logits = logits / self.temperature
+            return selective_log_softmax(logits, completion_ids) # (B, T)
+
+        with self._functorch_safe(base):
+            with torch.no_grad():
+                _, advantages = jvp(f, (params,), (target_gradient,))
+        return advantages.detach()
+
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
@@ -1725,18 +1866,10 @@ class OPSFTTrainer(_BaseTrainer):
             image_position_ids=inputs.get("image_position_ids"),
         )
 
-        logps = (per_token_logps * completion_mask).sum(1)  # mask out padding and tokens after EOS
-        old_logps = inputs["old_logps"]
-        log_ratio = logps - old_logps
-
-        # Compute the loss
-        advantages = inputs["advantages"]
-        coef_1 = torch.exp(log_ratio)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-        per_sequence_loss1 = coef_1 * advantages
-        per_sequence_loss2 = coef_2 * advantages
-        per_sequence_loss = -torch.min(per_sequence_loss1, per_sequence_loss2)
-        loss = per_sequence_loss.mean()
+        # Advantages already project the SFT target onto the score gradients, so the loss is just
+        # their inner product with the per-token log-probabilities.
+        advantages = inputs["advantages"]  # (batch, completion_length), from `_prepare_inputs`
+        loss = (advantages * per_token_logps * completion_mask).sum(1).mean()
 
         # Log the metrics
         mode = "train" if self.model.training else "eval"
@@ -1752,18 +1885,6 @@ class OPSFTTrainer(_BaseTrainer):
         )
         self._metrics[mode]["entropy"].append((entropy_stats[0] / entropy_stats[1].clamp(min=1.0)).item())
 
-        # Compute the clipped probability ratios
-        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
-        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
-        is_region_clipped = is_low_clipped | is_high_clipped
-        gathered_low_clip = self.accelerator.gather(is_low_clipped.float())
-        self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-        gathered_high_clip = self.accelerator.gather(is_high_clipped.float())
-        self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
-        gathered_clip_ratio = self.accelerator.gather(is_region_clipped.float())
-        self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
         return loss
 
     # During eval, Trainer calls prediction_step. If no labels are present in the inputs, it only runs forward and

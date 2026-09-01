@@ -63,6 +63,10 @@ class OPSFTConfig(_BaseConfig):
             save computation. If `None`, uses the value of `num_generations`.
         max_completion_length (`int` or `None`, *optional*, defaults to `512`):
             Maximum length of the generated completion.
+        max_length (`int`):
+            Maximum total length (prompt + gold completion) of the sequence used for the SFT target gradient. Has no
+            default and must be set: it bounds a teacher-forced forward whose logits are upcast to float32, so leaving
+            it unbounded lets a single long row exhaust the device.
         ds3_gather_for_generation (`bool`, *optional*, defaults to `True`):
             This setting applies to DeepSpeed ZeRO-3. If enabled, the policy model weights are gathered for generation,
             improving generation speed. However, disabling this option allows training models that exceed the VRAM
@@ -312,6 +316,13 @@ class OPSFTConfig(_BaseConfig):
     max_completion_length: int | None = field(
         default=512,
         metadata={"help": "Maximum length of the generated completion."},
+    )
+    max_length: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum total length (prompt + gold completion) of the sequence used for the SFT target "
+            "gradient. Required."
+        },
     )
     ds3_gather_for_generation: bool = field(
         default=True,
@@ -611,6 +622,12 @@ class OPSFTConfig(_BaseConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        if self.max_length is None:
+            raise ValueError(
+                "`max_length` must be set: it caps the prompt + gold completion sequence used for the SFT target "
+                "gradient, whose logits are upcast to float32."
+            )
 
         if self.use_transformers_paged:
             warnings.warn(

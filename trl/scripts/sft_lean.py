@@ -1,20 +1,45 @@
 """
 HF_HUB_OFFLINE=1 accelerate launch \
   --config_file /home/gaetan/projects/trl/examples/accelerate_configs/deepspeed_zero2.yaml \
-  scripts/sft_lean.py
+  scripts/sft_lean.py --trainer sft      # or: --trainer opsft
+                      [--lr 1e-6] [--expe-name my_run]
 """
 
 import re
 import time
 import os
+import argparse
 
 t = time.time()
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--trainer",
+    choices=["sft", "opsft"],
+    default="sft",
+    help="sft: teacher-forced on the gold proofs. opsft: on-policy, generates its own completions.",
+)
+parser.add_argument(
+    "--learning-rate",
+    "--lr",
+    type=float,
+    default=None,
+    help="Left to each config's own default when omitted (they differ between sft and opsft).",
+)
+parser.add_argument(
+    "--expe-name",
+    default=None,
+    help="wandb run name and checkpoint directory. Defaults to lean_<trainer>.",
+)
+cli = parser.parse_args()
+EXPE = cli.expe_name or f"lean_{cli.trainer}"
+
 os.environ["WANDB_PROJECT"] = "opsft2"
 
 import torch
 import torch.distributed as dist
 from datasets import load_dataset
-from trl import SFTTrainer, SFTConfig
+from trl import SFTTrainer, SFTConfig, OPSFTTrainer, OPSFTConfig
 from transformers import AutoTokenizer, TrainerCallback
 
 print(f"Imports done after {time.time() - t}")
@@ -216,31 +241,59 @@ class LeanEval(TrainerCallback):
             )
 
 
-config = SFTConfig(
-    output_dir="/checkpoint/scientific-reasoning/gaetan/ckpt/opsft2/lean_sft",
+common = dict(
+    output_dir=f"/checkpoint/scientific-reasoning/gaetan/ckpt/opsft2/{EXPE}",
     logging_first_step=True,
     report_to="wandb",
-    run_name="lean_sft",
+    run_name=EXPE,
     save_strategy="no",
     bf16=True,
-    # Lean proofs are long and unicode-heavy: the 1024 default truncates ~40% of them.
-    max_length=4096,
     per_device_train_batch_size=8,
     eval_strategy="steps",
     eval_steps=25,
-    eval_on_start=True,
+    logging_steps=1,
+    # eval_on_start=True,
+    # Lean proofs are long and unicode-heavy: the 1024 default truncates ~40% of them. In sft this
+    # caps the training sequence, in opsft the one used for the SFT target gradient -- same meaning,
+    # so set it once to keep the two runs comparable.
+    max_length=4096,
 )
+if cli.learning_rate is not None:
+    common["learning_rate"] = cli.learning_rate
+
+if cli.trainer == "opsft":
+    # max_completion_length bounds generation; max_length (above) bounds the teacher-forced pass.
+    # num_generations must divide the effective batch.
+    config = OPSFTConfig(**common, max_completion_length=1024, num_generations=2)
+else:
+    config = SFTConfig(**common)
 
 tok = AutoTokenizer.from_pretrained(MODEL)
 lean_eval = LeanEval(tok, eval_set)
 
-trainer = SFTTrainer(
-    model=MODEL,
-    args=config,
-    train_dataset=train_set,
-    eval_dataset=eval_set,
-    callbacks=[VibeCheck(tok=tok), lean_eval],
-)
+if cli.trainer == "opsft":
+    # reward_funcs is required by the trainer, but the OPSFT loss builds its advantages from the
+    # target gradient rather than from rewards, so a constant reward is a placeholder for now.
+    # `completion` (the gold proof) still reaches here as a kwarg: remove_unused_columns is False.
+    def zero_reward(completions, **kwargs):
+        return [0.0] * len(completions)
+
+    trainer = OPSFTTrainer(
+        model=MODEL,
+        reward_funcs=zero_reward,
+        args=config,
+        train_dataset=train_set,
+        eval_dataset=eval_set,
+        callbacks=[VibeCheck(tok=tok), lean_eval],
+    )
+else:
+    trainer = SFTTrainer(
+        model=MODEL,
+        args=config,
+        train_dataset=train_set,
+        eval_dataset=eval_set,
+        callbacks=[VibeCheck(tok=tok), lean_eval],
+    )
 lean_eval.trainer = trainer  # so it can log to wandb
 
 print(f"Training begins after {time.time() - t} sec")
