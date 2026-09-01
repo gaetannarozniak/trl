@@ -1044,6 +1044,34 @@ class OPSFTTrainer(_BaseTrainer):
             for m in gc_mods:
                 m.gradient_checkpointing = True
 
+    def _teacher_forced_batch(self, rows: list[dict[str, Any]]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pad the gold prompt + completion rows into `(input_ids, attention_mask, labels)`.
+
+        Labels supervise the completion tokens only; the prompt and the padding are -100.
+        """
+        device = self.accelerator.device
+        pad = self._tokenizer.pad_token_id
+
+        prompt_ids = self.processing_class(text=[r["prompt"] for r in rows])["input_ids"]
+        completion_ids = self.processing_class(
+            text=[r["completion"] for r in rows], add_special_tokens=False
+        )["input_ids"]
+
+        # Cap the total sequence: the caller's logits are upcast to float32 by ForCausalLMLoss, so one
+        # long row would otherwise size the whole padded batch. Prompts are short, so trim the
+        # completion rather than the sequence, which keeps every row with something to supervise.
+        completion_ids = [c[: max(self.max_length - len(p), 0)] for p, c in zip(prompt_ids, completion_ids)]
+
+        seq_len = max(len(p) + len(c) for p, c in zip(prompt_ids, completion_ids))
+        input_ids = torch.full((len(rows), seq_len), pad, dtype=torch.long, device=device)
+        attention_mask = torch.zeros((len(rows), seq_len), dtype=torch.long, device=device)
+        labels = torch.full((len(rows), seq_len), -100, dtype=torch.long, device=device)
+        for i, (p, c) in enumerate(zip(prompt_ids, completion_ids)):
+            input_ids[i, : len(p) + len(c)] = torch.tensor(p + c, device=device)
+            attention_mask[i, : len(p) + len(c)] = 1
+            labels[i, len(p) : len(p) + len(c)] = torch.tensor(c, device=device)  # completion only
+        return input_ids, attention_mask, labels
+
     def compute_sft_gradient(self, rows: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         """Gradient of the SFT loss on the dataset's gold completions, at the current weights.
 
@@ -1057,27 +1085,7 @@ class OPSFTTrainer(_BaseTrainer):
         parameter.
         """
         base = self.accelerator.unwrap_model(self.model)
-        device = self.accelerator.device
-        pad = self._tokenizer.pad_token_id
-
-        prompt_ids = self.processing_class(text=[r["prompt"] for r in rows])["input_ids"]
-        completion_ids = self.processing_class(
-            text=[r["completion"] for r in rows], add_special_tokens=False
-        )["input_ids"]
-
-        # Cap the total sequence: the logits below are upcast to float32 by ForCausalLMLoss, so one
-        # long row would otherwise size the whole padded batch. Prompts are short, so trim the
-        # completion rather than the sequence, which keeps every row with something to supervise.
-        completion_ids = [c[: max(self.max_length - len(p), 0)] for p, c in zip(prompt_ids, completion_ids)]
-
-        seq_len = max(len(p) + len(c) for p, c in zip(prompt_ids, completion_ids))
-        input_ids = torch.full((len(rows), seq_len), pad, dtype=torch.long, device=device)
-        attention_mask = torch.zeros((len(rows), seq_len), dtype=torch.long, device=device)
-        labels = torch.full((len(rows), seq_len), -100, dtype=torch.long, device=device)
-        for i, (p, c) in enumerate(zip(prompt_ids, completion_ids)):
-            input_ids[i, : len(p) + len(c)] = torch.tensor(p + c, device=device)
-            attention_mask[i, : len(p) + len(c)] = 1
-            labels[i, len(p) : len(p) + len(c)] = torch.tensor(c, device=device)  # completion only
+        input_ids, attention_mask, labels = self._teacher_forced_batch(rows)
 
         names = [n for n, p in base.named_parameters() if p.requires_grad]
         plist = [p for _, p in base.named_parameters() if p.requires_grad]
@@ -1150,9 +1158,14 @@ class OPSFTTrainer(_BaseTrainer):
         else:
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
             # local generation batch == local eval batch
+            rows = generation_batch
             inputs = self._generate_and_score_completions(generation_batch)
             # Skip the JVP during eval; zeros keep `_compute_loss` shape-compatible.
             inputs["advantages"] = torch.zeros_like(inputs["completion_mask"], dtype=torch.float32)
+            # The OPSFT loss is 0 by construction here, so eval reports the SFT loss instead. Keep
+            # the raw rows: it is teacher-forced on the gold completions, which the tensors above
+            # (built from the model's own generations) no longer carry.
+            inputs["gold_rows"] = rows
         return inputs
 
     def _log_completion_extra(self, column: str, values: list):
@@ -1884,6 +1897,15 @@ class OPSFTTrainer(_BaseTrainer):
             torch.stack([(entropies * completion_mask).sum(), completion_mask.sum().float()]), reduction="sum"
         )
         self._metrics[mode]["entropy"].append((entropy_stats[0] / entropy_stats[1].clamp(min=1.0)).item())
+
+        if mode == "eval":
+            # The advantages are zeroed during eval, so the OPSFT loss above carries no signal. Report
+            # the SFT loss instead -- the mean NLL of the gold completions under the current policy,
+            # the same quantity SFTTrainer evaluates, so the two runs can be compared on one axis.
+            input_ids, attention_mask, labels = self._teacher_forced_batch(inputs["gold_rows"])
+            loss = model(
+                input_ids=input_ids, attention_mask=attention_mask, labels=labels, use_cache=False
+            ).loss
 
         return loss
 
