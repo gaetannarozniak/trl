@@ -191,6 +191,25 @@ class OPSFTConfig(_BaseConfig):
         normalize_advantages (`bool`, *optional*, defaults to `False`):
             Whether to normalize advantages. Normalization is done per generation batch to have mean `0.0` and standard
             deviation of `1.0`.
+        score_norm_probes (`int`, *optional*, defaults to `0`):
+            Number of random probes used to estimate the squared norm of each token's score vector
+            `∇_θ log π(y_t)`. The advantage of a token is its inner product with the SFT gradient, which is the right
+            coefficient on that score vector only if the score vectors are orthonormal; dividing by their squared norms
+            undoes the diagonal part of that error (a Jacobi approximation of the orthogonal projection of the SFT
+            gradient onto their span). Each probe costs one extra forward-mode pass. `0` disables the correction and
+            the diagnostics it enables, leaving the raw inner products as advantages. `8` is a reasonable value.
+        score_projection_steps (`int`, *optional*, defaults to `0`):
+            Number of preconditioned conjugate-gradient steps used to solve `K c = a` for the advantages, where `K` is
+            the Gram matrix of the per-token score vectors and `a` their inner products with the SFT gradient. This is
+            the orthogonal projection of the SFT gradient onto the span of the score vectors; dividing by the score
+            norms alone (`0`) only corrects their lengths, not the angles between them, which is not enough once the
+            score vectors are appreciably aligned. Each step costs one backward plus one forward-mode pass. `3` gets
+            most of the way to the exact projection. Requires `score_norm_probes > 0` for the preconditioner.
+        score_norm_damping (`float`, *optional*, defaults to `1e-2`):
+            Damping added to the estimated squared score norms before dividing, as a fraction of their batch mean. It
+            bounds the amplification of tokens whose score norm is small or badly estimated. Large values recover the
+            undamped advantages up to a scale, so the diagnostics can be logged without changing the update direction.
+            Unused when `score_norm_probes` is `0`.
         reward_clip_range (`tuple[float, float]`, *optional*):
             Clip range for rewards as (min, max). If `None`, no clipping is applied.
         mask_truncated_completions (`bool`, *optional*, defaults to `False`):
@@ -540,6 +559,31 @@ class OPSFTConfig(_BaseConfig):
             "and standard deviation of `1.0`."
         },
     )
+    score_norm_probes: int = field(
+        default=0,
+        metadata={
+            "help": "Number of random probes used to estimate the squared norm of each token's score vector. The "
+            "advantages are divided by these norms, which undoes the diagonal part of the non-orthonormality of the "
+            "score vectors (a Jacobi approximation of the orthogonal projection of the SFT gradient onto their span). "
+            "Each probe costs one extra forward-mode pass. `0` disables the correction and the diagnostics it enables."
+        },
+    )
+    score_projection_steps: int = field(
+        default=0,
+        metadata={
+            "help": "Number of preconditioned conjugate-gradient steps used to solve for advantages that project the "
+            "SFT gradient onto the span of the per-token score vectors. `0` divides by the score norms only, which "
+            "corrects their lengths but not the angles between them. Each step costs one backward plus one "
+            "forward-mode pass. Requires `score_norm_probes > 0` for the preconditioner."
+        },
+    )
+    score_norm_damping: float = field(
+        default=1e-2,
+        metadata={
+            "help": "Damping added to the estimated squared score norms before dividing, as a fraction of their batch "
+            "mean. Large values recover the undamped advantages up to a scale. Unused when `score_norm_probes` is `0`."
+        },
+    )
     reward_clip_range: tuple[float, float] | None = field(
         default=None,
         metadata={"help": "Clip range for rewards as (min, max). If None, no clipping is applied."},
@@ -628,6 +672,12 @@ class OPSFTConfig(_BaseConfig):
             raise ValueError(
                 "`max_length` must be set: it caps the prompt + gold completion sequence used for the SFT target "
                 "gradient, whose logits are upcast to float32."
+            )
+
+        if self.score_projection_steps and not self.score_norm_probes:
+            raise ValueError(
+                "`score_projection_steps` needs `score_norm_probes > 0`: the probes estimate the score norms that "
+                "precondition the conjugate-gradient solve, without which it barely converges."
             )
 
         if self.use_transformers_paged:

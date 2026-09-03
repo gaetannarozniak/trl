@@ -1843,7 +1843,129 @@ class OPSFTTrainer(_BaseTrainer):
         with self._functorch_safe(base):
             with torch.no_grad():
                 _, advantages = jvp(f, (params,), (target_gradient,))
+        # Everything below needs the SFT gradient only through a = G g_sft and ||g_sft||^2, both of
+        # which are in hand now. Drop it here rather than in the caller: the projection allocates
+        # model-sized buffers of its own, and this one would otherwise stay live alongside them.
+        sft_sq = sum(v.float().pow(2).sum() for v in target_gradient.values())
+        target_gradient.clear()
+        a = advantages.float()
+        if self.args.score_norm_probes:
+            span = (base, f, params, input_ids, attention_mask, completion_ids)
+            advantages = self._project_advantages(advantages, *span)
+        self._log_sft_angle(advantages, a, sft_sq, base, input_ids, attention_mask, completion_ids)
         return advantages.detach()
+
+    def _score_vjp(self, u, base, input_ids, attention_mask, completion_ids):
+        """G^T u = ∇_θ Σ_t u_t log π(y_t), where G is the (tokens x parameters) matrix of score vectors.
+
+        An ordinary backward, so it runs outside `_functorch_safe` and keeps SDPA and gradient
+        checkpointing; the eager attention forward-mode needs would cost O(B H T^2) here for nothing.
+        """
+        names, plist = zip(*[(n, p) for n, p in base.named_parameters() if p.requires_grad])
+        logits = base(
+            input_ids=input_ids, attention_mask=attention_mask, use_cache=False,
+            logits_to_keep=completion_ids.size(1) + 1,
+        ).logits[:, :-1, :]
+        logps = selective_log_softmax(logits / self.temperature, completion_ids)
+        u = u * attention_mask[:, -completion_ids.size(1) :]
+        grads = torch.autograd.grad((u * logps).sum(), plist)
+        del logits, logps
+        if self.accelerator.num_processes > 1:
+            for v in grads:
+                dist.all_reduce(v)  # SUM, not mean: the other ranks own the rest of the tokens of G
+        return dict(zip(names, grads))
+
+    def _score_matvec(self, u, base, f, params, input_ids, attention_mask, completion_ids):
+        """K u = G G^T u, the Gram matrix of the score vectors applied to `u`."""
+        tangent = self._score_vjp(u, base, input_ids, attention_mask, completion_ids)
+        tangent.update({n: torch.zeros_like(p) for n, p in base.named_parameters() if not p.requires_grad})
+        with self._functorch_safe(base):
+            with torch.no_grad():
+                return jvp(f, (params,), (tangent,))[1].float()
+
+    def _log_sft_angle(self, c, a, sft_sq, base, input_ids, attention_mask, completion_ids):
+        """Angle between the SFT gradient and the update these advantages actually apply.
+
+        The loss Σ_t c_t log π(y_t) has gradient G^T c, so this is the exact angle between the step
+        OPSFT takes and the step SFT would have taken -- 90° means they are orthogonal and OPSFT is
+        not moving toward the SFT solution at all. Its cos² is the fraction of the SFT gradient the
+        update recovers, which factorizes as (how much of g_sft the span can express) x (how well
+        these coefficients exploit the span); only the second factor is what the projection improves.
+        Costs one backward per generation batch.
+        """
+        update = self._score_vjp(c, base, input_ids, attention_mask, completion_ids)
+        update_sq = sum(v.float().pow(2).sum() for v in update.values())
+        del update
+        # <g_sft, G^T c> = c . (G g_sft) = c . a, so the SFT gradient need not still be around.
+        mask = attention_mask[:, -completion_ids.size(1) :]
+        dot = self.accelerator.reduce((c * a * mask).sum(), reduction="sum")
+        cos = (dot / (update_sq * sft_sq).sqrt()).clamp(-1.0, 1.0)
+        mode = "train" if self.model.training else "eval"
+        self._metrics[mode]["advantages/sft_angle_deg"].append(torch.rad2deg(cos.arccos()).item())
+        self._metrics[mode]["advantages/captured_fraction"].append(cos.pow(2).item())
+
+    def _project_advantages(self, advantages, base, f, params, input_ids, attention_mask, completion_ids):
+        """Turn the raw inner products into coefficients that project g_sft onto span{g_t}.
+
+        a_t = <g_sft, g_t>, with g_t = ∇_θ log π(y_t), is the right coefficient on g_t only if the g_t
+        are orthonormal. They are not, so the coefficients solving min_c ||G^T c - g_sft||^2 are
+        c = K^+ a with K = G G^T: `a` is the desired change in the sampled logprobs, not the
+        coefficient vector. Two approximations of that solve, both driven by Hutchinson probes -- for
+        v ~ N(0, I) the JVP returns <g_t, v> for every token at once, and that scalar has variance
+        ||g_t||^2, so nothing of size P is materialized:
+
+        - `score_projection_steps = 0`: divide by the estimated ||g_t||^2, which fixes the norms but
+          not the angles between score vectors. Only adequate when they are near-orthogonal.
+        - `score_projection_steps = j`: j steps of conjugate gradient on (K + λI) c = a, preconditioned
+          by those same norms. Step 1 is the diagonal fix, so this strictly generalizes it.
+
+        The quality of the result is reported by `_log_sft_angle`, exactly rather than from the probes.
+        """
+        n, steps = self.args.score_norm_probes, self.args.score_projection_steps
+        generator = torch.Generator(device=self.accelerator.device)
+        tangent = {k: torch.empty_like(v) for k, v in params.items()}  # refilled in place: it is model-sized
+        probes = []
+        with self._functorch_safe(base):
+            with torch.no_grad():
+                for i in range(n):
+                    generator.manual_seed(self.state.global_step * n + i)  # every rank must draw the same v
+                    for v in tangent.values():
+                        v.normal_(generator=generator)
+                    probes.append(jvp(f, (params,), (tangent,))[1].float())
+        del tangent
+
+        mask = attention_mask[:, -completion_ids.size(1) :].float()
+        probes, advantages = torch.stack(probes), advantages.float()
+        squares = probes.pow(2)
+        score_norms_sq = squares.mean(0)
+        totals = self.accelerator.reduce(torch.stack([(score_norms_sq * mask).sum(), mask.sum()]), reduction="sum")
+        damping = self.args.score_norm_damping * totals[0] / totals[1]
+        precond = score_norms_sq + damping
+        a = advantages * mask
+
+        if steps:
+            matvec = lambda u: (
+                self._score_matvec(u, base, f, params, input_ids, attention_mask, completion_ids) * mask
+                + damping * u
+            )
+            c, r = torch.zeros_like(a), a.clone()
+            z = r / precond
+            p, rz = z.clone(), self.accelerator.reduce((r * z).sum(), reduction="sum")
+            for _ in range(steps):
+                Kp = matvec(p)
+                alpha = rz / self.accelerator.reduce((p * Kp).sum(), reduction="sum")
+                c, r = c + alpha * p, r - alpha * Kp
+                z = r / precond
+                rz_next = self.accelerator.reduce((r * z).sum(), reduction="sum")
+                p, rz = z + (rz_next / rz) * p, rz_next
+        else:
+            c = advantages / precond
+
+        # The correction can only matter if the score norms are far from uniform.
+        norms = score_norms_sq[mask.bool()]
+        mode = "train" if self.model.training else "eval"
+        self._metrics[mode]["advantages/score_norm_ratio"].append((norms.quantile(0.9) / norms.quantile(0.1)).item())
+        return c
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):

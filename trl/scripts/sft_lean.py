@@ -2,7 +2,9 @@
 HF_HUB_OFFLINE=1 accelerate launch \
   --config_file /home/gaetan/projects/trl/examples/accelerate_configs/deepspeed_zero2.yaml \
   scripts/sft_lean.py --trainer sft      # or: --trainer opsft
-                      [--lr 1e-6] [--expe-name my_run]
+                      [--lr 1e-6] [--expe-name my_run] [--n-train 512] [--n-epochs 1]
+                      [--beta 0] [--use-vllm] [--seed 7]
+                      [--score-norm-probes 8] [--score-projection-steps 8] [--score-norm-damping 1e-6]
 """
 
 import re
@@ -27,12 +29,106 @@ parser.add_argument(
     help="Left to each config's own default when omitted (they differ between sft and opsft).",
 )
 parser.add_argument(
+    "--n-train",
+    type=int,
+    default=None,
+    help="Truncate the training set to this many examples. Uses the whole set when omitted.",
+)
+parser.add_argument(
+    "--n-epochs",
+    type=float,
+    default=100,
+    help="Number of training epochs.",
+)
+parser.add_argument(
+    "--use-vllm",
+    action="store_true",
+    help="opsft only. Generate the completions with vLLM instead of transformers. Generation dominates the step, "
+    "so this is the largest speedup available, but colocate mode reserves --vllm-gpu-mem of every GPU for it.",
+)
+parser.add_argument(
+    "--vllm-gpu-mem",
+    type=float,
+    default=0.3,
+    help="Fraction of each GPU vLLM reserves in colocate mode. Lower it if the training step then runs out of "
+    "memory, raise it if vLLM cannot fit the KV cache.",
+)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=42,
+    help="Seeds the training run: which prompts land in which batch, and the sampling of the completions. The "
+    "train/eval split is NOT affected -- it stays on seed 0 so the held-out set is the same across every run.",
+)
+parser.add_argument(
+    "--beta",
+    type=float,
+    default=0.05,
+    help="opsft only. KL coefficient against the reference model. `0` drops the reference model entirely, which "
+    "frees its memory and skips a forward pass per generation batch.",
+)
+parser.add_argument(
+    "--score-norm-probes",
+    type=int,
+    default=0,
+    help="opsft only. Divide the advantages by the per-token score norms, estimated with this many random "
+    "probes, and log how much of the SFT gradient the update recovers. `0` keeps the raw inner products.",
+)
+parser.add_argument(
+    "--score-projection-steps",
+    type=int,
+    default=0,
+    help="opsft only. Conjugate-gradient steps solving for advantages that project the SFT gradient onto the span "
+    "of the score vectors, rather than only rescaling them. Needs --score-norm-probes > 0. `3` is a good start.",
+)
+parser.add_argument(
+    "--score-norm-damping",
+    type=float,
+    default=1e-2,
+    help="opsft only. Damping on the projection solve, as a fraction of the mean score norm. This, not the step "
+    "count, is what caps how close the solve gets: 1e-2 saturates immediately, 1e-6 keeps improving to ~8 steps.",
+)
+parser.add_argument(
     "--expe-name",
     default=None,
-    help="wandb run name and checkpoint directory. Defaults to lean_<trainer>.",
+    help="wandb run name and checkpoint directory. Defaults to a name built from the settings that differ from "
+    "the defaults, e.g. lean_opsft_lr1e-5_ntrain600_hutch8_proj3.",
+)
+parser.add_argument(
+    "--print-run-name",
+    action="store_true",
+    help="Print the run name and exit, without importing torch. Used by submit_lean.sh to name the slurm job.",
 )
 cli = parser.parse_args()
-EXPE = cli.expe_name or f"lean_{cli.trainer}"
+
+
+def run_name():
+    """lean_<trainer>, then one segment per setting that differs from its default."""
+    fmt = lambda x: format(x, "g").replace("e-0", "e-").replace("e+0", "e")
+    parts = [f"lean_{cli.trainer}"]
+    if cli.learning_rate is not None:
+        parts.append(f"lr{fmt(cli.learning_rate)}")
+    if cli.n_train is not None:
+        parts.append(f"ntrain{cli.n_train}")
+    if cli.trainer == "opsft" and cli.use_vllm:
+        parts.append("vllm")
+    if cli.seed != parser.get_default("seed"):
+        parts.append(f"seed{cli.seed}")
+    if cli.trainer == "opsft" and cli.beta != parser.get_default("beta"):
+        parts.append(f"beta{fmt(cli.beta)}")
+    if cli.trainer == "opsft" and cli.score_norm_probes:
+        parts.append(f"hutch{cli.score_norm_probes}")
+        if cli.score_projection_steps:
+            parts.append(f"proj{cli.score_projection_steps}")
+            if cli.score_norm_damping != parser.get_default("score_norm_damping"):
+                parts.append(f"damp{fmt(cli.score_norm_damping)}")
+    return "_".join(parts)
+
+
+EXPE = cli.expe_name or run_name()
+if cli.print_run_name:
+    print(EXPE)
+    raise SystemExit
 
 os.environ["WANDB_PROJECT"] = "opsft2"
 
@@ -45,6 +141,14 @@ from transformers import AutoTokenizer, TrainerCallback
 print(f"Imports done after {time.time() - t}")
 
 MODEL = "allenai/Olmo-3-1025-7B"
+tok = AutoTokenizer.from_pretrained(MODEL)
+
+# Bounds the padded sequence the opsft JVP runs on. That pass is forced onto eager attention
+# (forward-mode AD has no SDPA rule), so it materializes a B x heads x T x T float32 tensor: with
+# T = max_prompt + max_completion, one 3.3k-token outlier in a batch takes it from 1.4 to 19 GiB.
+# Filtered, not truncated -- a cut-off theorem statement is not a well-formed prompt, and the gold
+# proof would no longer match it. Costs ~0.25% of the rows (prompts are p50 82, p90 149 tokens).
+MAX_PROMPT_TOKENS = 512
 
 ds = load_dataset("AI-MO/NuminaMath-LEAN")["train"]
 # Only human-written proofs that are actually complete: autoformalizer statements have no
@@ -72,8 +176,16 @@ def preprocess_function(example):
 
 ds = ds.map(preprocess_function, remove_columns=ds.column_names)
 ds = ds.filter(lambda e: e["prompt"] is not None and e["completion"].strip())
+n_before = len(ds)
+ds = ds.filter(
+    lambda batch: [len(ids) <= MAX_PROMPT_TOKENS for ids in tok(batch["prompt"])["input_ids"]],
+    batched=True,
+)
+print(f"dropped {n_before - len(ds)}/{n_before} rows with prompts over {MAX_PROMPT_TOKENS} tokens")
 split = ds.train_test_split(test_size=0.05, seed=0)
 train_set, eval_set = split["train"], split["test"]
+if cli.n_train is not None:
+    train_set = train_set.select(range(min(cli.n_train, len(train_set))))
 print(f"train: {len(train_set)}  eval: {len(eval_set)}")
 
 
@@ -247,6 +359,7 @@ common = dict(
     report_to="wandb",
     run_name=EXPE,
     save_strategy="no",
+    seed=cli.seed,
     bf16=True,
     per_device_train_batch_size=8,
     eval_strategy="steps",
@@ -260,16 +373,31 @@ common = dict(
 )
 if cli.learning_rate is not None:
     common["learning_rate"] = cli.learning_rate
+common["num_train_epochs"] = cli.n_epochs
 
 if cli.trainer == "opsft":
     # max_completion_length bounds generation; max_length (above) bounds the teacher-forced pass.
     # One generation per prompt: the OPSFT advantages come from the SFT target gradient, not from a
     # group baseline, so a group of 1 is fine and halves the generation cost per prompt.
-    config = OPSFTConfig(**common, max_completion_length=1024, num_generations=1)
+    config = OPSFTConfig(
+        **common,
+        max_completion_length=1024,
+        num_generations=1,
+        beta=cli.beta,
+        use_vllm=cli.use_vllm,
+        vllm_gpu_memory_utilization=cli.vllm_gpu_mem,
+        # Prompts are filtered to MAX_PROMPT_TOKENS, so this is the tightest window that always fits.
+        vllm_max_model_length=MAX_PROMPT_TOKENS + 1024,
+        score_norm_probes=cli.score_norm_probes,
+        score_projection_steps=cli.score_projection_steps,
+        score_norm_damping=cli.score_norm_damping,
+        # Each projection step is a full backward, so the activations of an uncheckpointed one are
+        # paid j times over -- and next to vLLM's reserved fraction there is no room for them.
+        gradient_checkpointing=cli.score_projection_steps > 0,
+    )
 else:
     config = SFTConfig(**common)
 
-tok = AutoTokenizer.from_pretrained(MODEL)
 lean_eval = LeanEval(tok, eval_set)
 
 if cli.trainer == "opsft":
