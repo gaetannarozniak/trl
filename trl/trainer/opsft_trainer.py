@@ -1149,6 +1149,7 @@ class OPSFTTrainer(_BaseTrainer):
                     target_gradient, input_ids, attention_mask, generation_batch["completion_ids"].size(1)
                 )
                 del target_gradient, rows
+                self._log_advantage_viz(generation_batch)
 
                 generation_batch = split_pixel_values_by_grid(generation_batch)
                 generation_batch = shuffle_sequence_dict(generation_batch)
@@ -1849,11 +1850,14 @@ class OPSFTTrainer(_BaseTrainer):
         sft_sq = sum(v.float().pow(2).sum() for v in target_gradient.values())
         target_gradient.clear()
         a = advantages.float()
-        if self.args.score_norm_probes:
+        projected = bool(self.args.score_norm_probes)
+        if projected:
             span = (base, f, params, input_ids, attention_mask, completion_ids)
             advantages = self._project_advantages(advantages, *span)
-        self._log_sft_angle(advantages, a, sft_sq, base, input_ids, attention_mask, completion_ids)
-        return advantages.detach()
+        # The overshoot guard applies only to a projection: G^T a is F g_sft, whose norm is legitimately
+        # larger than ||g_sft||, so clamping the unprojected path would be clamping nothing meaningful.
+        scale = self._log_sft_angle(advantages, a, sft_sq, base, input_ids, attention_mask, completion_ids)
+        return (advantages * scale if projected else advantages).detach()
 
     def _score_vjp(self, u, base, input_ids, attention_mask, completion_ids):
         """G^T u = ∇_θ Σ_t u_t log π(y_t), where G is the (tokens x parameters) matrix of score vectors.
@@ -1883,6 +1887,135 @@ class OPSFTTrainer(_BaseTrainer):
             with torch.no_grad():
                 return jvp(f, (params,), (tangent,))[1].float()
 
+    def _log_advantage_viz(self, generation_batch):
+        """Send rank 0's trajectories to wandb as per-token advantage heatmaps and their distribution.
+
+        One span per token, its background interpolated from a neutral midpoint towards blue for a
+        positive advantage and red for a negative one, so sign reads as polarity and magnitude as
+        saturation. The two poles are lightness-matched and stay above 4.5:1 contrast against the
+        token ink over the whole ramp, so the text is legible at any advantage. Prompt tokens are
+        greyed: they carry no advantage. The scale is the 98th percentile of |advantage|, which keeps
+        a single outlier token from flattening the rest to the midpoint; hover gives the exact value.
+        """
+        every, n_trajectories = 10, 4
+        # global_step is still 0 throughout the first training step, so this fires there and then
+        # every `every` optimizer steps.
+        if self.state.global_step % every or not self.accelerator.is_main_process or wandb.run is None:
+            return
+        import html
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        adv = generation_batch["advantages"].float().cpu()
+        mask = generation_batch["completion_mask"].bool().cpu()
+        prompt_ids, prompt_mask = generation_batch["prompt_ids"].cpu(), generation_batch["prompt_mask"].bool().cpu()
+        completion_ids = generation_batch["completion_ids"].cpu()
+        values = adv[mask]
+        scale = values.abs().quantile(0.98).clamp(min=1e-30).item()
+        mid, poles = (240, 239, 236), {True: (57, 135, 229), False: (227, 73, 72)}
+
+        def cell(v):
+            t = min(1.0, abs(v) / scale)
+            return "#%02x%02x%02x" % tuple(round(m + (p - m) * t) for m, p in zip(mid, poles[v >= 0]))
+
+        def esc(tid):
+            return html.escape(self.processing_class.decode([tid])).replace("\n", "↵<br>")
+
+        blocks = []
+        for i in range(min(n_trajectories, adv.size(0))):
+            spans = [f"<span style='color:#898781'>{esc(t)}</span>" for t in prompt_ids[i][prompt_mask[i]].tolist()]
+            spans.append("<span style='color:#c3c2b7'> ▏</span>")
+            for tid, v in zip(completion_ids[i][mask[i]].tolist(), adv[i][mask[i]].tolist()):
+                spans.append(
+                    f"<span title='{v:+.4g}' style='background:{cell(v)};color:#0b0b0b;"
+                    f"border-radius:2px;padding:1px 0'>{esc(tid)}</span>"
+                )
+            blocks.append(
+                f"<div style='margin:14px 0'><div style='color:#52514e;font-size:11px;margin-bottom:4px'>"
+                f"trajectory {i} &middot; {int(mask[i].sum())} tokens</div>"
+                f"<div style='line-height:1.9;font-family:ui-monospace,monospace;font-size:11px'>"
+                f"{''.join(spans)}</div></div>"
+            )
+        legend = "".join(
+            f"<span style='background:{cell(s * scale)};padding:1px 10px;border-radius:2px'>&nbsp;</span>"
+            for s in (-1, -0.5, 0, 0.5, 1)
+        )
+        page = (
+            f"<html><body style='background:#fcfcfb;color:#0b0b0b;font-family:system-ui,sans-serif;padding:14px'>"
+            f"<div style='font-size:13px;margin-bottom:6px'>Per-token advantage &mdash; "
+            f"step {self.state.global_step}</div>"
+            f"<div style='font-size:11px;color:#52514e'>{-scale:+.3g} {legend} {scale:+.3g}"
+            f" &nbsp;&nbsp;red = negative, blue = positive, grey = prompt. Hover a token for its value.</div>"
+            f"{''.join(blocks)}</body></html>"
+        )
+
+        v = values.numpy()
+        fig, axes = plt.subplots(1, 2, figsize=(11, 3.6), facecolor="#fcfcfb")
+        for ax in axes:
+            ax.set_facecolor("#fcfcfb")
+            ax.grid(True, color="#e1e0d9", linewidth=0.8)
+            ax.set_axisbelow(True)
+            ax.tick_params(colors="#898781", labelsize=8)
+            for side, spine in ax.spines.items():
+                spine.set_visible(side in ("left", "bottom"))
+                spine.set_color("#c3c2b7")
+        # Symlog bins on both arms: the advantages span decades, and linear bins put everything in
+        # the centre bin with the tail invisible at one count each.
+        top, lin = np.abs(v).max(), max(np.percentile(np.abs(v), 25), np.abs(v).max() * 1e-6)
+        edges = np.concatenate([-np.geomspace(top, lin, 45), [0.0], np.geomspace(lin, top, 45)])
+        axes[0].hist(v, bins=edges, color="#2a78d6")
+        axes[0].set_xscale("symlog", linthresh=lin)
+        axes[0].set_yscale("log")
+        # A few round decades per arm, clear of the linear region: symlog's own ticks pile up on 0
+        # there. Zero needs no label, the rule marks it.
+        decades = 10.0 ** np.arange(int(np.ceil(np.log10(lin * 10))), int(np.ceil(np.log10(top))) + 1)
+        decades = decades[:: max(1, len(decades) // 3)] if len(decades) else np.array([top])
+        axes[0].set_xticks(np.concatenate([-decades[::-1], decades]))
+        axes[0].axvline(0.0, color="#898781", linewidth=1)
+        axes[0].set_title("distribution", fontsize=10, color="#0b0b0b", loc="left")
+        axes[0].set_xlabel("advantage", fontsize=9, color="#52514e")
+        axes[0].set_ylabel("tokens", fontsize=9, color="#52514e")
+        ranked = np.sort(np.abs(v))[::-1]
+        share = np.cumsum(ranked) / max(ranked.sum(), 1e-30) * 100
+        axes[1].plot(np.arange(1, len(ranked) + 1) / len(ranked) * 100, share, color="#2a78d6", linewidth=2)
+        axes[1].plot([0, 100], [0, 100], color="#c3c2b7", linewidth=1, linestyle="--")
+        axes[1].set_title("concentration", fontsize=10, color="#0b0b0b", loc="left")
+        axes[1].set_xlabel("% of tokens, largest |advantage| first", fontsize=9, color="#52514e")
+        axes[1].set_ylabel("% of total |advantage|", fontsize=9, color="#52514e")
+        stats = {
+            "mean": v.mean(),
+            "std": v.std(),
+            "min": v.min(),
+            "max": v.max(),
+            "frac_positive": (v > 0).mean(),
+            "top1pct_share": share[max(len(share) // 100 - 1, 0)] / 100,
+        }
+        fig.suptitle(
+            "  ".join(f"{k} {val:+.3g}" for k, val in stats.items()), fontsize=9, color="#52514e", x=0.01, ha="left"
+        )
+        fig.tight_layout()
+
+        # No explicit step: transformers logs without one too, so wandb's internal counter counts log
+        # calls rather than optimizer steps, and passing a step behind it silently drops the media.
+        # The histogram is of log10|advantage|, not of the raw values: they span decades, so a linear
+        # histogram is one spike. Sign is carried by frac_positive and the signed quantiles below.
+        wandb.log(
+            {
+                "advantages/tokens": wandb.Html(page),
+                "advantages/distribution": wandb.Image(fig),
+                "advantages/log10_abs": wandb.Histogram(np.log10(np.maximum(np.abs(v), top * 1e-12))),
+            }
+        )
+        plt.close(fig)
+        # Quantiles give the shape as ordinary line charts, which is what a static image cannot do:
+        # the spread over training is the thing worth watching.
+        stats.update({f"p{q}": np.percentile(v, q) for q in (1, 5, 25, 50, 75, 95, 99)})
+        for key, val in stats.items():
+            self._metrics["train"][f"advantages/{key}"].append(float(val))
+
     def _log_sft_angle(self, c, a, sft_sq, base, input_ids, attention_mask, completion_ids):
         """Angle between the SFT gradient and the update these advantages actually apply.
 
@@ -1903,6 +2036,15 @@ class OPSFTTrainer(_BaseTrainer):
         mode = "train" if self.model.training else "eval"
         self._metrics[mode]["advantages/sft_angle_deg"].append(torch.rad2deg(cos.arccos()).item())
         self._metrics[mode]["advantages/captured_fraction"].append(cos.pow(2).item())
+
+        # Every filter factor of the damped solve lies in [0, 1), so the exact answer satisfies
+        # ||G^T c|| <= ||g_sft||: a projection cannot lengthen what it projects. A CG iterate is not
+        # monotone in that norm and does occasionally overshoot -- one step at 28x the median norm and
+        # 78 degrees off g_sft cost a permanent +0.03 eval NLL. Scale such a step back to the bound
+        # rather than dropping it; the angle above is scale-free, so the diagnostics are unaffected.
+        overshoot = (update_sq / sft_sq).sqrt()
+        self._metrics[mode]["advantages/update_norm_ratio"].append(overshoot.item())
+        return overshoot.clamp(min=1.0).reciprocal()
 
     def _project_advantages(self, advantages, base, f, params, input_ids, attention_mask, completion_ids):
         """Turn the raw inner products into coefficients that project g_sft onto span{g_t}.
@@ -1961,10 +2103,15 @@ class OPSFTTrainer(_BaseTrainer):
         else:
             c = advantages / precond
 
-        # The correction can only matter if the score norms are far from uniform.
+        # The correction can only matter if the score norms are far from uniform. The q10 underflows
+        # to exactly 0 once a tenth of the tokens are confident enough that e_y - p rounds away in
+        # bf16, which made this inf on 16 of 968 steps of a real run; `log()` filters NaN but not inf,
+        # so one such step poisons the whole averaging window. Clamp by the floor the preconditioner
+        # already applies -- the dynamic range the solver sees is the useful quantity anyway.
         norms = score_norms_sq[mask.bool()]
         mode = "train" if self.model.training else "eval"
-        self._metrics[mode]["advantages/score_norm_ratio"].append((norms.quantile(0.9) / norms.quantile(0.1)).item())
+        ratio = norms.quantile(0.9) / norms.quantile(0.1).clamp(min=damping)
+        self._metrics[mode]["advantages/score_norm_ratio"].append(ratio.item())
         return c
 
     @profiling_decorator
