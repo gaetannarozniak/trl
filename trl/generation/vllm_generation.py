@@ -167,10 +167,21 @@ class VLLMGeneration:
             Model context length (prompt and completion). Set it to at least the maximum prompt length in the dataset
             plus `max_completion_length`; if omitted, it is inferred from the model config.
         max_num_seqs (`int`, *optional*):
-            Maximum number of sequences to process in parallel, effectively capping the batch size.
+            Maximum number of sequences to process in parallel, effectively capping the batch size. Raise it to get
+            more decode parallelism when GPU memory allows; lower it if the KV cache does not fit.
+        max_num_batched_tokens (`int`, *optional*, defaults to `4096`):
+            Maximum number of tokens processed in a single engine step (the chunked-prefill chunk size). Raise it for
+            long prompts/completions to reduce the number of prefill chunks; lower it to cut activation memory. The
+            default is deliberately modest because the vLLM v1 memory profiler is misled by the high vLLM default
+            (32768), wrongly concluding there is not enough memory.
         enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Whether to enable sleep mode for the engine to offload weights/cache during the optimizer step. Keeps GPU
             memory usage low, but waking the engine adds host–device transfer latency.
+        attention_backend (`str`, *optional*):
+            Attention backend for the colocated engine, e.g. `"FLASH_ATTN"`, `"TRITON_ATTN"` or `"FLASHINFER"`. `None`
+            lets vLLM choose. Useful when the default (FlashInfer) is unusable, for instance on an offline node where
+            it cannot fetch prebuilt kernels and has to JIT-compile them. Note the `VLLM_ATTENTION_BACKEND`
+            environment variable no longer exists in recent vLLM versions, so this must be passed through.
         model_impl (`str`, *optional*, defaults to `"auto"`):
             Model implementation to use for vLLM.
             - "auto" will try to use the vLLM implementation, if it exists, and fall back to the Transformers
@@ -240,8 +251,10 @@ class VLLMGeneration:
         gpu_memory_utilization: float = 0.9,
         max_model_length: int | None = None,
         max_num_seqs: int | None = None,
+        max_num_batched_tokens: int = 4096,
         enable_sleep_mode: bool = False,
         model_impl: str = "auto",
+        attention_backend: str | None = None,
         trust_remote_code: bool = False,
         # Generation configuration
         repetition_penalty: float = 1.0,
@@ -274,8 +287,10 @@ class VLLMGeneration:
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_length = max_model_length
         self.max_num_seqs = max_num_seqs
+        self.max_num_batched_tokens = max_num_batched_tokens
         self.enable_sleep_mode = enable_sleep_mode
         self.model_impl = model_impl
+        self.attention_backend = attention_backend
         self.trust_remote_code = trust_remote_code
 
         # Generation configuration
@@ -359,8 +374,10 @@ class VLLMGeneration:
                 distributed_executor_backend="external_launcher",
                 # Feed identical seed for tp groups to ensure sampling results are the same across workers
                 seed=accelerator.process_index // self.tensor_parallel_size,
-                # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
-                max_num_batched_tokens=4096,
+                # Defaults to 4096 rather than vLLM's 32768: the v1 memory profiler is misled by the high default,
+                # thinking there's not enough memory. Raise it for long sequences.
+                max_num_batched_tokens=self.max_num_batched_tokens,
+                **({} if self.attention_backend is None else {"attention_backend": self.attention_backend}),
                 # Important so temperature scaling/logit tweaking affects the TIS log probs
                 logprobs_mode="processed_logprobs",
                 quantization=quantization,
@@ -509,6 +526,7 @@ class VLLMGeneration:
         images: list[list | None] | None,
         num_generations: int,
         profiler: ProfilingContext | None = None,
+        sampling_overrides: dict | None = None,
     ) -> tuple:
         """Generate completions using vLLM.
 
@@ -518,6 +536,12 @@ class VLLMGeneration:
                 corresponding prompt, or `None` if no images for that prompt. `None` if no images at all.
             num_generations: Number of generations per prompt.
             profiler: Optional profiler for performance tracking.
+            sampling_overrides: Optional per-call overrides for the sampling parameters set at construction. Accepted
+                keys: `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `max_completion_length` and
+                `logprobs`. Anything omitted falls back to the instance value. This lets a single engine serve both
+                training rollouts and evaluation (e.g. greedy, longer, no logprobs) without paying for a second
+                engine's memory reservation. Note `max_completion_length` can only be lowered relative to the
+                engine's `max_model_length`, which is fixed at construction.
 
         Returns:
             Tuple of (prompt_ids, completion_ids, logprobs, logprob_token_ids).
@@ -532,12 +556,14 @@ class VLLMGeneration:
         """
         profiler = profiler or nullcontext()
         accelerator = self.accelerator
-        temperature = self.temperature
-        top_p = self.top_p
-        top_k = self.top_k
-        min_p = self.min_p
-        repetition_penalty = self.repetition_penalty
-        max_completion_length = self.max_completion_length
+        overrides = sampling_overrides or {}
+        temperature = overrides.get("temperature", self.temperature)
+        top_p = overrides.get("top_p", self.top_p)
+        top_k = overrides.get("top_k", self.top_k)
+        min_p = overrides.get("min_p", self.min_p)
+        repetition_penalty = overrides.get("repetition_penalty", self.repetition_penalty)
+        max_completion_length = overrides.get("max_completion_length", self.max_completion_length)
+        logprobs = overrides.get("logprobs", self.logprobs)
 
         # Sleep level 2 discards the weights, so waking up isn't enough: they must be re-pushed from the training
         # model. vLLM's `reload_weights` can't be used here, as it reloads the initial checkpoint from disk rather
@@ -569,7 +595,7 @@ class VLLMGeneration:
                     "top_k": top_k,
                     "min_p": 0.0 if min_p is None else min_p,
                     "max_tokens": max_completion_length,
-                    "logprobs": self.logprobs,
+                    "logprobs": logprobs,
                     "structured_outputs_regex": self.structured_outputs_regex,
                     "generation_kwargs": self.generation_kwargs,
                 }
@@ -616,9 +642,11 @@ class VLLMGeneration:
                 "top_k": top_k,
                 "min_p": 0.0 if min_p is None else min_p,
                 "max_tokens": max_completion_length,
-                "logprobs": self.logprobs,
+                "logprobs": logprobs,
             }
             generation_kwargs.update(self.generation_kwargs)
+            # Per-call overrides win over the instance-level `generation_kwargs` set at construction.
+            generation_kwargs.update(overrides.get("generation_kwargs", {}))
 
             if self.structured_outputs_regex is not None:
                 if generation_kwargs.get("structured_outputs") is not None:

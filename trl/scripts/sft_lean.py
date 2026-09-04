@@ -1,8 +1,12 @@
 """
-HF_HUB_OFFLINE=1 accelerate launch \
-  --config_file /home/gaetan/projects/trl/examples/accelerate_configs/deepspeed_zero2.yaml \
-  scripts/sft_lean.py --trainer sft      # or: --trainer opsft
-                      [--lr 1e-6] [--expe-name my_run]
+Slurm (1 node, 4x GB300, DDP):
+  sbatch launchers/slurm/sft_lean.sbatch
+  sbatch --export=ALL,TRAINER=opsft,EXPE=my_run,LR=1e-6 launchers/slurm/sft_lean.sbatch
+
+Interactive equivalent:
+  accelerate launch --num_processes 4 --mixed_precision bf16 \
+    trl/scripts/sft_lean.py --trainer sft   # or: --trainer opsft
+                            [--lr 1e-6] [--expe-name my_run]
 """
 
 import re
@@ -44,9 +48,9 @@ from transformers import AutoTokenizer, TrainerCallback
 
 print(f"Imports done after {time.time() - t}")
 
-MODEL = "allenai/Olmo-3-1025-7B"
+MODEL = "/checkpoint/fort/models/Olmo-3-1025-7B"
 
-ds = load_dataset("AI-MO/NuminaMath-LEAN")["train"]
+ds = load_dataset("/storage/home/ilabiad/checkpoint/datasets/huggingface/NuminaMath-LEAN")["train"]
 # Only human-written proofs that are actually complete: autoformalizer statements have no
 # proof at all, "statement" is a bare sorry, and "with_sorry" has holes in it.
 ds = ds.filter(lambda e: e["author"] == "human" and e["ground_truth_type"] == "complete")
@@ -102,7 +106,7 @@ class VibeCheck(TrainerCallback):
 
 # Mathlib v4.15.0, matching the version NuminaMath-LEAN was verified against. Calibration:
 # 100/100 human gold proofs compile here, vs 64/100 on the v4.25.2 workspace.
-WS = "/storage/home/gaetan/lean/workspace-v4.15"
+WS = "/storage/home/ilabiad/lean/workspace-v4.15"
 
 IMPORT_LINE = re.compile(r"^\s*import\b.*$", re.M)
 
@@ -134,9 +138,12 @@ class LeanEval(TrainerCallback):
 
             def make_cfg():
                 return LeanREPLConfig(
-                    project=LocalProject(directory=WS),
+                    # auto_build=False: the workspace is prebuilt (see launchers/slurm), so skip
+                    # the `lake exe cache get` + `lake build` that LocalProject runs by default --
+                    # it costs minutes per job and reaches for the network from a compute node.
+                    project=LocalProject(directory=WS, auto_build=False),
                     local_repl_path=f"{WS}/.lake/packages/REPL",  # capitalised at the v4.15 tag
-                    lake_path="/home/gaetan/.elan/bin/lake",
+                    lake_path="/home/ilabiad/.elan/bin/lake",
                     build_repl=False,
                 )
 
@@ -242,13 +249,13 @@ class LeanEval(TrainerCallback):
 
 
 common = dict(
-    output_dir=f"/checkpoint/scientific-reasoning/gaetan/ckpt/opsft2/{EXPE}",
+    output_dir=f"/checkpoint/fort/ilabiad/opsft2/{EXPE}",
     logging_first_step=True,
     report_to="wandb",
     run_name=EXPE,
     save_strategy="no",
     bf16=True,
-    per_device_train_batch_size=8,
+    per_device_train_batch_size=16,
     eval_strategy="steps",
     eval_steps=25,
     logging_steps=1,

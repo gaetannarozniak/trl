@@ -1,0 +1,101 @@
+# Plain SFT on human-written Lean proofs.
+#
+#   accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml \
+#     launchers/baselines/train.py --config launchers/baselines/configs/sft.yaml
+#
+# `beta: 0.0` keeps the KL out of the loss, but the reference model is still loaded and
+# `train/kl` / `eval/kl` are still logged -- that is the drift-from-base curve, and it is
+# directly comparable with the sft_kl run.
+
+env:
+  WANDB_PROJECT: opsft2
+  # FlashInfer JIT-compiles its sampler kernels, which needs a CUDA toolkit the compute nodes do
+  # not have and network access they do not get. The attention backend is handled separately by
+  # `vllm_attention_backend`.
+  VLLM_USE_FLASHINFER_SAMPLER: 0
+  TOKENIZERS_PARALLELISM: false
+
+model_name_or_path: /checkpoint/fort/models/Olmo-3-1025-7B
+dtype: bfloat16
+
+# --- data ---
+dataset_key: numina_lean
+eval_fraction: 0.05
+dataset_seed: 0
+
+# --- reference model / KL ---
+beta: 0.0
+# ref_model_path: defaults to the policy's initial checkpoint
+
+# --- optimisation ---
+# Global batch 256 sequences ~= 274k tokens (mean 1072 tok/seq after truncation at 8192, of which
+# 979 carry gradient). Olmo-3's SFT recipe is 5e-5 at ~1M tokens/batch; scaling that down gives
+# 1.4e-5 (linear) to 2.6e-5 (sqrt, the better-founded rule for Adam). 1e-5 sits below both, which
+# is the right side to err on with a constant schedule -- no decay means ~2x the total learning of
+# a run annealing from the same peak.
+num_train_epochs: 5          # long enough to see where it overfits
+learning_rate: 1.0e-5
+lr_scheduler_type: constant_with_warmup
+# transformers 5.x removed `warmup_ratio`; only `warmup_steps` exists. The ratio form was silently
+# swallowed as an unknown arg, so earlier runs had no warmup at all. ~6% of 170 steps.
+warmup_steps: 10
+# 256 global via accumulation rather than a huge per-device batch: HF pads each micro-batch to its
+# longest member, so a bigger micro-batch wastes *more* on padding and multiplies activation
+# memory, while accumulation yields an identical gradient at constant memory.
+per_device_train_batch_size: 16
+gradient_accumulation_steps: 4
+per_device_eval_batch_size: 16
+# 16 micro-batches of activations per step is the cost of a 256 global batch; recomputation trades
+# ~30% step time for the memory that makes it fit alongside the reference model and vLLM.
+gradient_checkpointing: true
+bf16: true
+# Gold completions are median 602 / mean 986 tokens. 8192 truncates only 0.1% of training
+# examples; 4096 truncated 5.7%, and `truncation_mode: keep_start` cuts the tail *including* the
+# appended EOS, which teaches those examples not to stop.
+max_length: 8192
+
+# --- checkpointing ---
+# Off by default: these are 7B checkpoints and baselines are read through their metrics. Set
+# `save_final_model: true` (or SAVE=1 in the launcher) to keep the trained weights.
+save_strategy: "no"
+save_final_model: false
+
+# --- logging / eval cadence ---
+report_to: wandb
+run_name: lean_sft
+logging_steps: 1
+logging_first_step: true
+eval_strategy: steps
+eval_steps: 5
+eval_on_start: true          # the base-model baseline; never measured before
+lean_eval_steps: 34      # once per epoch (34 steps/epoch at global batch 256)
+vibecheck_steps: 34      # once per epoch
+vibecheck_n: 2
+vibecheck_max_new_tokens: 1024
+
+# --- vLLM evaluation engine ---
+# 0.3 left only ~71GB for KV after vLLM's own weight copy. Olmo-3 is MHA (no GQA) at ~2.8GB
+# per 9216-token sequence, so that capped concurrency near 25 and generation ran at ~2.5k
+# tok/s/rank. Measured peak was 191/284GB, so this keeps ~35GB of headroom.
+vllm_gpu_memory_utilization: 0.45
+vllm_max_model_length: 9216
+vllm_max_num_seqs: 40
+vllm_max_num_batched_tokens: 8192
+vllm_attention_backend: FLASH_ATTN
+vllm_enable_sleep_mode: false
+
+# --- Lean verification ---
+# Mathlib v4.15.0, the version NuminaMath-LEAN was verified against: 100/100 human gold proofs
+# compile here versus 64/100 on the v4.25.2 workspace.
+lean_workspace: /storage/home/ilabiad/lean/workspace-v4.15
+lake_path: /home/ilabiad/.elan/bin/lake
+lean_num_workers: 30         # 144 CPUs / 4 ranks, leaving 6 per rank for training + dataloader
+lean_timeout: 60
+lean_eval_n: null            # whole eval split (~472 theorems)
+lean_max_new_tokens: 8192
+
+# Each rank blocks at an all_reduce after verifying its shard, so the slowest shard defines the
+# collective duration. Verification measured 1012s for 472 proofs at 8192 tokens against NCCL's
+# 1800s default watchdog -- too little headroom once the model writes longer proofs, and crossing
+# it kills the job with a NCCL timeout rather than a clean error.
+ddp_timeout: 10800
