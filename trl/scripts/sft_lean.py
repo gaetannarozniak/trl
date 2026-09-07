@@ -136,7 +136,7 @@ import torch
 import torch.distributed as dist
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig, OPSFTTrainer, OPSFTConfig
-from transformers import AutoTokenizer, TrainerCallback
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 
 print(f"Imports done after {time.time() - t}")
 
@@ -234,6 +234,7 @@ class LeanEval(TrainerCallback):
         self.num_workers, self.timeout = num_workers, timeout
         self.pool, self.env = None, None
         self.trainer = None
+        self.last = None  # (prompts, completions) of the latest eval, for OnPolicyKL to reuse
 
     def _get_pool(self, rank):
         # Built lazily on first eval: each worker loads Mathlib (~20 s), so we pay this once
@@ -290,6 +291,7 @@ class LeanEval(TrainerCallback):
                 model, self.tok, shard[i : i + self.gen_batch_size]["prompt"], self.max_new_tokens
             )
         model.train()
+        self.last = (list(shard["prompt"]), completions)
         t_gen = time.time() - t0
         n_new = sum(len(self.tok(c)["input_ids"]) for c in completions)
 
@@ -353,6 +355,66 @@ class LeanEval(TrainerCallback):
             )
 
 
+class OnPolicyKL(TrainerCallback):
+    """mean_t [log pi_theta(y_t) - log pi_base(y_t)] over the policy's OWN generations.
+
+    The same estimator and the same token-mean normalisation OPSFTTrainer logs as `kl`
+    (opsft_trainer.py:1751), but run identically for both trainers, which is what makes SFT and
+    OPSFT comparable on it. A KL over the *gold* tokens would be pointless here: it equals
+    base_nll - eval_loss exactly, so it carries nothing the eval loss does not already.
+
+    It reuses the completions LeanEval has just produced, so the only extra work is one forward of
+    the frozen base model. Those are greedy (see `_generate`), so this measures drift of the greedy
+    mode; OPSFTTrainer's own `kl` averages over temperature-1.0 samples. Trends are comparable
+    between the two trainers, the absolute value is not comparable to `train/kl`.
+    """
+
+    def __init__(self, tok, lean_eval):
+        self.tok, self.lean_eval = tok, lean_eval
+        self.base, self.trainer = None, None
+
+    def _sum_logps(self, model, prompts, completions):
+        """(sum of log pi over the completion tokens, how many there were)."""
+        total, count = 0.0, 0
+        for prompt, completion in zip(prompts, completions):
+            pi = self.tok(prompt)["input_ids"]
+            ci = self.tok(completion, add_special_tokens=False)["input_ids"]
+            if not ci:
+                continue
+            ids = torch.tensor([pi + ci], device=model.device)
+            with torch.no_grad():
+                logits = model(ids).logits[0, len(pi) - 1 : -1].float()
+            target = torch.tensor(ci, device=model.device).unsqueeze(-1)
+            total += logits.log_softmax(-1).gather(-1, target).sum().item()
+            count += len(ci)
+        return total, count
+
+    def on_evaluate(self, args, state, control, model=None, **kwargs):
+        if model is None or self.lean_eval.last is None:
+            return
+        if self.base is None:
+            # Lazily loaded: a second copy of the model is 14 GB, so a run that never evaluates
+            # never pays for it.
+            self.base = AutoModelForCausalLM.from_pretrained(
+                MODEL, dtype=torch.bfloat16, device_map={"": model.device}
+            ).eval()
+            self.base.requires_grad_(False)
+
+        prompts, completions = self.lean_eval.last
+        model.eval()
+        theta, n = self._sum_logps(model, prompts, completions)
+        base, _ = self._sum_logps(self.base, prompts, completions)
+        model.train()
+
+        # Every rank scores its own shard; sum both accumulators so the ratio is the token-mean over
+        # the whole eval set rather than a per-rank average of per-rank means.
+        stats = torch.tensor([theta - base, float(n)], device=model.device)
+        if dist.is_initialized():
+            dist.all_reduce(stats)
+        if state.is_world_process_zero:
+            self.trainer.log({"eval/on_policy_kl": (stats[0] / stats[1].clamp(min=1.0)).item()})
+
+
 common = dict(
     output_dir=f"/checkpoint/scientific-reasoning/gaetan/ckpt/opsft2/{EXPE}",
     logging_first_step=True,
@@ -399,6 +461,9 @@ else:
     config = SFTConfig(**common)
 
 lean_eval = LeanEval(tok, eval_set)
+# Registered after lean_eval so it runs second and can reuse the completions lean_eval just made.
+on_policy_kl = OnPolicyKL(tok, lean_eval)
+callbacks = [VibeCheck(tok=tok), lean_eval, on_policy_kl]
 
 if cli.trainer == "opsft":
     # reward_funcs is required by the trainer, but the OPSFT loss builds its advantages from the
@@ -413,7 +478,7 @@ if cli.trainer == "opsft":
         args=config,
         train_dataset=train_set,
         eval_dataset=eval_set,
-        callbacks=[VibeCheck(tok=tok), lean_eval],
+        callbacks=callbacks,
     )
 else:
     trainer = SFTTrainer(
@@ -421,9 +486,10 @@ else:
         args=config,
         train_dataset=train_set,
         eval_dataset=eval_set,
-        callbacks=[VibeCheck(tok=tok), lean_eval],
+        callbacks=callbacks,
     )
-lean_eval.trainer = trainer  # so it can log to wandb
+lean_eval.trainer = trainer  # so they can log to wandb
+on_policy_kl.trainer = trainer
 
 print(f"Training begins after {time.time() - t} sec")
 trainer.train()

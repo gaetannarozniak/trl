@@ -1849,6 +1849,7 @@ class OPSFTTrainer(_BaseTrainer):
         # model-sized buffers of its own, and this one would otherwise stay live alongside them.
         sft_sq = sum(v.float().pow(2).sum() for v in target_gradient.values())
         target_gradient.clear()
+        self._cg_residuals = []  # filled by the CG loop, read by _log_advantage_viz
         a = advantages.float()
         projected = bool(self.args.score_norm_probes)
         if projected:
@@ -1953,7 +1954,8 @@ class OPSFTTrainer(_BaseTrainer):
         )
 
         v = values.numpy()
-        fig, axes = plt.subplots(1, 2, figsize=(11, 3.6), facecolor="#fcfcfb")
+        panels = 3 if len(self._cg_residuals) > 1 else 2
+        fig, axes = plt.subplots(1, panels, figsize=(5.5 * panels, 3.6), facecolor="#fcfcfb")
         for ax in axes:
             ax.set_facecolor("#fcfcfb")
             ax.grid(True, color="#e1e0d9", linewidth=0.8)
@@ -1985,6 +1987,18 @@ class OPSFTTrainer(_BaseTrainer):
         axes[1].set_title("concentration", fontsize=10, color="#0b0b0b", loc="left")
         axes[1].set_xlabel("% of tokens, largest |advantage| first", fontsize=9, color="#52514e")
         axes[1].set_ylabel("% of total |advantage|", fontsize=9, color="#52514e")
+        if panels == 3:
+            # r^T M^-1 r per conjugate-gradient iteration: how far the solve actually got this step.
+            # A flat line means the extra iterations bought nothing and `score_projection_steps`
+            # could come down; a still-falling one means it is being cut short.
+            axes[2].plot(range(len(self._cg_residuals)), self._cg_residuals, color="#2a78d6",
+                         linewidth=2, marker="o", markersize=5)
+            axes[2].set_yscale("log")
+            axes[2].set_title("cg residual", fontsize=10, color="#0b0b0b", loc="left")
+            axes[2].set_xlabel("conjugate-gradient iteration", fontsize=9, color="#52514e")
+            axes[2].set_ylabel("$r^T M^{-1} r$", fontsize=9, color="#52514e")
+            axes[2].set_xticks(range(len(self._cg_residuals)))
+
         stats = {
             "mean": v.mean(),
             "std": v.std(),
@@ -2084,6 +2098,7 @@ class OPSFTTrainer(_BaseTrainer):
         damping = self.args.score_norm_damping * totals[0] / totals[1]
         precond = score_norms_sq + damping
         a = advantages * mask
+        mode = "train" if self.model.training else "eval"
 
         if steps:
             matvec = lambda u: (
@@ -2093,6 +2108,9 @@ class OPSFTTrainer(_BaseTrainer):
             c, r = torch.zeros_like(a), a.clone()
             z = r / precond
             p, rz = z.clone(), self.accelerator.reduce((r * z).sum(), reduction="sum")
+            # r^T M^-1 r after each iteration. Already reduced, so recording it is free, and it is
+            # the only honest answer to "are `steps` enough": flat means the solve is not moving.
+            self._cg_residuals = [rz.item()]
             for _ in range(steps):
                 Kp = matvec(p)
                 alpha = rz / self.accelerator.reduce((p * Kp).sum(), reduction="sum")
@@ -2100,6 +2118,9 @@ class OPSFTTrainer(_BaseTrainer):
                 z = r / precond
                 rz_next = self.accelerator.reduce((r * z).sum(), reduction="sum")
                 p, rz = z + (rz_next / rz) * p, rz_next
+                self._cg_residuals.append(rz.item())
+            res = self._cg_residuals
+            self._metrics[mode]["advantages/cg_residual_ratio"].append(res[-1] / max(res[0], 1e-30))
         else:
             c = advantages / precond
 
@@ -2109,7 +2130,6 @@ class OPSFTTrainer(_BaseTrainer):
         # so one such step poisons the whole averaging window. Clamp by the floor the preconditioner
         # already applies -- the dynamic range the solver sees is the useful quantity anyway.
         norms = score_norms_sq[mask.bool()]
-        mode = "train" if self.model.training else "eval"
         ratio = norms.quantile(0.9) / norms.quantile(0.1).clamp(min=damping)
         self._metrics[mode]["advantages/score_norm_ratio"].append(ratio.item())
         return c
