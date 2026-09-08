@@ -1160,6 +1160,7 @@ class OPSFTTrainer(_BaseTrainer):
                 generation_batch["advantages"] = self._compute_opsft_advantages(
                     target_gradient, input_ids, attention_mask, generation_batch["completion_ids"].size(1)
                 )
+                self._gold_rows = rows  # the natural-gradient loss needs them again in compute_loss
                 del target_gradient, rows
                 self._log_advantage_viz(generation_batch)
 
@@ -2191,6 +2192,12 @@ class OPSFTTrainer(_BaseTrainer):
         # their inner product with the per-token log-probabilities.
         advantages = inputs["advantages"]  # (batch, completion_length), from `_prepare_inputs`
         loss = (advantages * per_token_logps * completion_mask).sum(1).mean()
+
+        if self.args.natural_gradient:
+            # (I - P) g*, the complement of the projection: the `.mean()` above divided by n, so undo it.
+            n = advantages.size(0) * self.accelerator.num_processes
+            gold = self._teacher_forced_batch(self._gold_rows)
+            loss = model(input_ids=gold[0], attention_mask=gold[1], labels=gold[2], use_cache=False).loss - n * loss
 
         # Log the metrics
         mode = "train" if self.model.training else "eval"

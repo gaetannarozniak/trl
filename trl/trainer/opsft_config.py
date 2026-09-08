@@ -210,6 +210,10 @@ class OPSFTConfig(_BaseConfig):
             bounds the amplification of tokens whose score norm is small or badly estimated. Large values recover the
             undamped advantages up to a scale, so the diagnostics can be logged without changing the update direction.
             Unused when `score_norm_probes` is `0`.
+        natural_gradient (`bool`, *optional*, defaults to `False`):
+            Apply the complement of the projection, `(I - P) g*`, instead of `P g*`. By the Woodbury identity this is
+            the damped natural gradient of the SFT loss under the on-policy Fisher, so the two updates partition `g*`
+            between them. It costs one extra forward-backward on the gold completions per generation batch.
         score_projection_best_iterate (`bool`, *optional*, defaults to `False`):
             Take the conjugate-gradient iterate with the smallest residual rather than the last one. The number of
             iterations is unchanged, so this costs nothing; only which iterate is kept differs. The matvec is
@@ -593,6 +597,13 @@ class OPSFTConfig(_BaseConfig):
         metadata={
             "help": "Damping added to the estimated squared score norms before dividing, as a fraction of their batch "
             "mean. Large values recover the undamped advantages up to a scale. Unused when `score_norm_probes` is `0`."
+        },
+    )
+    natural_gradient: bool = field(
+        default=False,
+        metadata={
+            "help": "Apply the complement of the projection, `(I - P) g*`, instead of `P g*`: the damped natural "
+            "gradient of the SFT loss under the on-policy Fisher. Costs one extra forward-backward per batch."
         },
     )
     score_projection_best_iterate: bool = field(

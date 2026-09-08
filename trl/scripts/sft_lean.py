@@ -89,6 +89,12 @@ parser.add_argument(
     "count, is what caps how close the solve gets: 1e-2 saturates immediately, 1e-6 keeps improving to ~8 steps.",
 )
 parser.add_argument(
+    "--natural-gradient",
+    action="store_true",
+    help="opsft only. Apply the complement of the projection, (I - P) g*, rather than P g*: the damped natural "
+    "gradient of the SFT loss under the on-policy Fisher. The two updates partition the SFT gradient."
+)
+parser.add_argument(
     "--score-projection-best-iterate",
     action="store_true",
     help="opsft only. Keep the conjugate-gradient iterate with the smallest residual rather than the last one. Same "
@@ -173,6 +179,8 @@ def run_name():
                 parts.append(f"damp{fmt(cli.score_norm_damping)}")
             if cli.score_projection_best_iterate:
                 parts.append("best")
+    if cli.trainer == "opsft" and cli.natural_gradient:
+        parts.append("natgrad")
     if cli.trainer == "opsft" and cli.sft_gradient_ema:
         parts.append(f"ema{fmt(cli.sft_gradient_ema)}")
     return "_".join(parts)
@@ -521,6 +529,7 @@ if cli.trainer == "opsft":
         score_norm_probes=cli.score_norm_probes,
         score_projection_steps=cli.score_projection_steps,
         score_norm_damping=cli.score_norm_damping,
+        natural_gradient=cli.natural_gradient,
         score_projection_best_iterate=cli.score_projection_best_iterate,
         sft_gradient_ema=cli.sft_gradient_ema,
         # Next to vLLM's reserved fraction, uncheckpointed activations OOM on step 0 at any step count.
