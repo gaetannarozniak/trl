@@ -73,7 +73,6 @@ declare -A STATE
 while IFS='|' read -r name st; do
     case "$st" in
         PENDING | RUNNING | COMPLETING | SUSPENDED | REQUEUED | COMPLETED | TIMEOUT) STATE[$name]=$st ;;
-        *) STATE[$name]= ;;
     esac
 done < <(sacct -u "$USER" -S "${SINCE:-now-3days}" -X -n -P -o JobName,State)
 

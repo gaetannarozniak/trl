@@ -61,16 +61,12 @@ CONFIGS=(
     "--lr 3e-6 --score-norm-probes 8 --score-projection-steps 1 --score-norm-damping 1e-2 --seed 45"
 )
 
-# Most recent state slurm holds for each run name. A config whose job is alive or finished is left
-# alone, so rerunning this script submits exactly the ones that died -- there is no list of failures
-# to maintain by hand, and nothing is duplicated if it is run twice. TIMEOUT counts as finished: at
-# 100 epochs the wall clock is what ends a healthy run, not the epoch count. sacct lists ascending
-# by job id, so a later attempt overwrites the verdict of an earlier one.
+# Names with a live or finished job, so a rerun submits exactly the ones that died. TIMEOUT counts
+# as finished: at 100 epochs the wall clock is what ends a healthy run.
 declare -A STATE
 while IFS='|' read -r name st; do
     case "$st" in
         PENDING | RUNNING | COMPLETING | SUSPENDED | REQUEUED | COMPLETED | TIMEOUT) STATE[$name]=$st ;;
-        *) STATE[$name]= ;;
     esac
 done < <(sacct -u "$USER" -S "${SINCE:-now-3days}" -X -n -P -o JobName,State)
 
