@@ -53,6 +53,9 @@ CONFIGS=(
     "--lr 1e-6 --score-norm-probes 8 --score-projection-steps 8 --score-norm-damping 1e-1"
     "--lr 1e-5 --score-norm-probes 8 --score-projection-steps 8 --score-norm-damping 1e-1"
 
+    # --- G: best CG iterate, paired with the damp3e-2 cell of block A (1) ----------------------
+    "--lr 3e-6 --score-norm-probes 8 --score-projection-steps 8 --score-norm-damping 3e-2 --score-projection-best-iterate"
+
     # --- F: third seed on both arms of the centre (2) ------------------------------------------
     # Seeds 43 and 44 are already running on each arm. A third puts a spread on the comparison
     # every single-seed cell above has to be read against.
