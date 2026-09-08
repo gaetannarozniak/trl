@@ -1055,8 +1055,10 @@ class OPSFTTrainer(_BaseTrainer):
         pad = self._tokenizer.pad_token_id
 
         prompt_ids = self.processing_class(text=[r["prompt"] for r in rows])["input_ids"]
+        # EOS exactly as SFTTrainer appends it, or the target never supervises stopping.
+        eos = self._tokenizer.eos_token
         completion_ids = self.processing_class(
-            text=[r["completion"] for r in rows], add_special_tokens=False
+            text=[r["completion"].removesuffix(eos) + eos for r in rows], add_special_tokens=False
         )["input_ids"]
 
         # Cap the total sequence: the caller's logits are upcast to float32 by ForCausalLMLoss, so one
