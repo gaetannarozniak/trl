@@ -246,7 +246,10 @@ print(f"train: {len(train_set)}  eval: {len(eval_set)}")
 
 def _generate(model, tok, prompts, max_new_tokens):
     enc = tok(list(prompts), return_tensors="pt", padding=True, padding_side="left").to(model.device)
-    out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tok.pad_token_id, temperature=1.0)
+    # Untruncated T=1 samples rather than the greedy mode; top_p/top_k are pinned because some
+    # models ship their own in generation_config.
+    out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=True, temperature=1.0,
+                         top_p=1.0, top_k=0, pad_token_id=tok.pad_token_id)
     return tok.batch_decode(out[:, enc["input_ids"].shape[1] :], skip_special_tokens=True)
 
 
