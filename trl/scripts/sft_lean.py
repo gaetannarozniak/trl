@@ -118,6 +118,16 @@ parser.add_argument(
     "this one.",
 )
 parser.add_argument(
+    "--model",
+    default="allenai/Olmo-3-1025-7B",
+    help="Base model to train, and the reference OnPolicyKL measures drift against.",
+)
+parser.add_argument(
+    "--name-prefix",
+    default="",
+    help="Prepended to the derived run name, e.g. `1_sweep`, so the runs of one sweep group together.",
+)
+parser.add_argument(
     "--expe-name",
     default=None,
     help="wandb run name and checkpoint directory. Defaults to a name built from the settings that differ from "
@@ -132,9 +142,11 @@ cli = parser.parse_args()
 
 
 def run_name():
-    """lean_<trainer>, then one segment per setting that differs from its default."""
+    """[prefix_]lean_<trainer>, then one segment per setting that differs from its default."""
     fmt = lambda x: format(x, "g").replace("e-0", "e-").replace("e+0", "e")
-    parts = [f"lean_{cli.trainer}"]
+    parts = ([cli.name_prefix] if cli.name_prefix else []) + [f"lean_{cli.trainer}"]
+    if cli.model != parser.get_default("model"):
+        parts.append(os.path.basename(cli.model))
     if cli.init_from is not None:
         # .../lean_sft_ntrain1600/checkpoint-25 -> from_sft_ntrain1600_25. Both halves are needed:
         # a continuation says nothing without which run and which step it started from.
@@ -181,7 +193,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 
 print(f"Imports done after {time.time() - t}")
 
-MODEL = "allenai/Olmo-3-1025-7B"
+MODEL = cli.model
 # MODEL stays the pretrained base elsewhere: it is what OnPolicyKL measures drift against.
 INIT = cli.init_from or MODEL
 tok = AutoTokenizer.from_pretrained(MODEL)
