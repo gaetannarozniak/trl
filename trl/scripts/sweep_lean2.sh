@@ -8,12 +8,12 @@
 #   TIME=48:00:00 ./sweep_lean2.sh  # 16 arms at 96h is 12k GPU-hours; 48h still clears the transient
 #   STAGGER=900 ./sweep_lean2.sh    # widen the start spread while the NFS is degraded
 #
-# The four seed43/seed44 entries at the centre are already running; they are listed so that a rerun
-# revives them if they die, and skipped otherwise.
+# Every name carries the 1_sweep prefix, so the four seed43/seed44 centre jobs already running under
+# unprefixed names do not match and would be launched again: scancel them before the first run.
 set -euo pipefail
 
 REPO=/storage/home/gaetan/projects/trl
-BASE="--trainer opsft --use-vllm --vllm-gpu-mem 0.2 --beta ${BETA:-1e-8}"
+BASE="--trainer opsft --use-vllm --vllm-gpu-mem 0.2 --beta ${BETA:-1e-8} --name-prefix ${PREFIX:-1_sweep}"
 CENTRE="--lr 3e-6 --score-norm-probes 8 --score-projection-steps 8 --score-norm-damping 1e-1"
 
 CONFIGS=(
