@@ -89,6 +89,22 @@ parser.add_argument(
     "count, is what caps how close the solve gets: 1e-2 saturates immediately, 1e-6 keeps improving to ~8 steps.",
 )
 parser.add_argument(
+    "--init-from",
+    default=None,
+    help="Path to a checkpoint whose weights start the run, e.g. a checkpoint-25 left by an earlier "
+    "sft run. Only the starting weights move: the on-policy KL is still measured against the "
+    "pretrained base, so the metric means the same thing in a continuation as in a run from scratch.",
+)
+parser.add_argument(
+    "--save-steps",
+    type=int,
+    nargs="+",
+    default=[],
+    help="Global steps at which to write a checkpoint. Nothing is saved at any other step, and the "
+    "optimizer state is not saved at all: these checkpoints exist to seed a later run, not to resume "
+    "this one.",
+)
+parser.add_argument(
     "--expe-name",
     default=None,
     help="wandb run name and checkpoint directory. Defaults to a name built from the settings that differ from "
@@ -106,6 +122,14 @@ def run_name():
     """lean_<trainer>, then one segment per setting that differs from its default."""
     fmt = lambda x: format(x, "g").replace("e-0", "e-").replace("e+0", "e")
     parts = [f"lean_{cli.trainer}"]
+    if cli.init_from is not None:
+        # .../lean_sft_ntrain1600/checkpoint-25 -> from_sft_ntrain1600_25. Both halves are needed:
+        # a continuation says nothing without which run and which step it started from.
+        src = cli.init_from.rstrip("/")
+        parts.append(
+            f"from_{os.path.basename(os.path.dirname(src)).removeprefix('lean_')}"
+            f"_{os.path.basename(src).split('-')[-1]}"
+        )
     if cli.learning_rate is not None:
         parts.append(f"lr{fmt(cli.learning_rate)}")
     if cli.n_train is not None:
@@ -141,6 +165,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 print(f"Imports done after {time.time() - t}")
 
 MODEL = "allenai/Olmo-3-1025-7B"
+# Where the weights start. MODEL keeps pointing at the pretrained base everywhere else on purpose:
+# it is what OnPolicyKL measures drift against, so `eval/on_policy_kl` still means distance from the
+# base model in a continuation rather than distance from the checkpoint it happens to resume.
+INIT = cli.init_from or MODEL
 tok = AutoTokenizer.from_pretrained(MODEL)
 
 # Bounds the padded sequence the opsft JVP runs on. That pass is forced onto eager attention
@@ -247,22 +275,19 @@ class LeanEval(TrainerCallback):
 
             def make_cfg():
                 return LeanREPLConfig(
-                    project=LocalProject(directory=WS),
+                    # auto_build takes a FileLock on `{WS}.lock` -- one file shared by every rank of
+                    # every job on the cluster, on NFS. A sweep reaching its first eval together
+                    # races create against unlink on that inode and the losers get ESTALE. The
+                    # workspace is built once, by hand, so there is nothing for the lock to guard.
+                    project=LocalProject(directory=WS, auto_build=False),
                     local_repl_path=f"{WS}/.lake/packages/REPL",  # capitalised at the v4.15 tag
                     lake_path="/home/gaetan/.elan/bin/lake",
                     build_repl=False,
                 )
 
-            # Constructing the config runs `lake exe cache get`, which unpacks into the shared
-            # ~/.cache/mathlib. Eight ranks doing that at once corrupt each other's .ltar files
-            # and the REPL then dies with BrokenPipeError, so rank 0 goes first and the rest
-            # attach to the finished project.
-            if rank == 0:
-                cfg = make_cfg()
-            if dist.is_initialized():
-                dist.barrier()
-            if rank != 0:
-                cfg = make_cfg()
+            # No rank-0-goes-first dance any more: it guarded `lake exe cache get` unpacking into
+            # the shared ~/.cache/mathlib, and auto_build=False means nothing unpacks anything.
+            cfg = make_cfg()
 
             self.pool = LeanServerPool(cfg, num_workers=self.num_workers)
             # One session-cached `import Mathlib`; workers replay it on first use, then cache it.
@@ -415,12 +440,31 @@ class OnPolicyKL(TrainerCallback):
             self.trainer.log({"eval/on_policy_kl": (stats[0] / stats[1].clamp(min=1.0)).item()})
 
 
+class SaveAtSteps(TrainerCallback):
+    """Checkpoint at exactly the requested steps, and at no other one.
+
+    `save_strategy="no"` leaves `should_save` false at every step, and the default flow callback runs
+    before this one, so raising the flag here is the whole mechanism: the Trainer saves at the end of
+    the step on the flag alone.
+    """
+
+    def __init__(self, steps):
+        self.steps = set(steps)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step in self.steps:
+            control.should_save = True
+
+
 common = dict(
     output_dir=f"/checkpoint/scientific-reasoning/gaetan/ckpt/opsft2/{EXPE}",
     logging_first_step=True,
     report_to="wandb",
     run_name=EXPE,
-    save_strategy="no",
+    save_strategy="no",  # --save-steps drives the only checkpoints these runs write
+    # A 7B checkpoint is 14 GiB of weights against ~84 GiB of fp32 master copy and Adam moments, and
+    # nothing resumes these runs -- the next stage starts a new trainer from the weights.
+    save_only_model=True,
     seed=cli.seed,
     bf16=True,
     per_device_train_batch_size=8,
@@ -454,8 +498,10 @@ if cli.trainer == "opsft":
         score_projection_steps=cli.score_projection_steps,
         score_norm_damping=cli.score_norm_damping,
         # Each projection step is a full backward, so the activations of an uncheckpointed one are
-        # paid j times over -- and next to vLLM's reserved fraction there is no room for them.
-        gradient_checkpointing=cli.score_projection_steps > 0,
+        # paid j times over -- and next to vLLM's reserved fraction there is no room for them. Not
+        # conditioned on the step count: with vLLM holding its share, even the runs that do no
+        # projection at all OOM on step 0 without it.
+        gradient_checkpointing=True,
     )
 else:
     config = SFTConfig(**common)
@@ -464,6 +510,8 @@ lean_eval = LeanEval(tok, eval_set)
 # Registered after lean_eval so it runs second and can reuse the completions lean_eval just made.
 on_policy_kl = OnPolicyKL(tok, lean_eval)
 callbacks = [VibeCheck(tok=tok), lean_eval, on_policy_kl]
+if cli.save_steps:
+    callbacks.append(SaveAtSteps(cli.save_steps))
 
 if cli.trainer == "opsft":
     # reward_funcs is required by the trainer, but the OPSFT loss builds its advantages from the
@@ -473,7 +521,7 @@ if cli.trainer == "opsft":
         return [0.0] * len(completions)
 
     trainer = OPSFTTrainer(
-        model=MODEL,
+        model=INIT,
         reward_funcs=zero_reward,
         args=config,
         train_dataset=train_set,
@@ -482,7 +530,7 @@ if cli.trainer == "opsft":
     )
 else:
     trainer = SFTTrainer(
-        model=MODEL,
+        model=INIT,
         args=config,
         train_dataset=train_set,
         eval_dataset=eval_set,
