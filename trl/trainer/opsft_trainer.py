@@ -580,6 +580,8 @@ class OPSFTTrainer(_BaseTrainer):
         # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
         # `_get_train_sampler` and `_prepare_inputs`.
         self._buffered_inputs = None
+        # Running average of the SFT gradient under `sft_gradient_ema`; parameter-sized, so it stays None otherwise.
+        self._sft_gradient = None
 
         # Transformers explicitly set use_reentrant=True in the past to silence a PyTorch warning, but the default was
         # never updated once PyTorch switched to recommending use_reentrant=False. Until that change lands upstream
@@ -1145,6 +1147,16 @@ class OPSFTTrainer(_BaseTrainer):
                     [generation_batch["prompt_mask"], generation_batch["completion_mask"]], dim=1
                 )
                 target_gradient = self.compute_sft_gradient(rows)
+                if self.args.sft_gradient_ema:
+                    # One batch of gold completions is a noisy estimate of the direction the advantages are
+                    # supposed to project onto. Averaging it costs no pass -- the batch gradient is computed
+                    # either way -- but the running copy stays resident, which is why it is opt-in.
+                    if self._sft_gradient is None:
+                        self._sft_gradient = target_gradient  # nothing to average with on the first round
+                    else:
+                        for name, avg in self._sft_gradient.items():
+                            avg.lerp_(target_gradient[name], 1 - self.args.sft_gradient_ema)
+                    target_gradient = self._sft_gradient
                 generation_batch["advantages"] = self._compute_opsft_advantages(
                     target_gradient, input_ids, attention_mask, generation_batch["completion_ids"].size(1)
                 )
@@ -1848,7 +1860,8 @@ class OPSFTTrainer(_BaseTrainer):
         # which are in hand now. Drop it here rather than in the caller: the projection allocates
         # model-sized buffers of its own, and this one would otherwise stay live alongside them.
         sft_sq = sum(v.float().pow(2).sum() for v in target_gradient.values())
-        target_gradient.clear()
+        if not self.args.sft_gradient_ema:  # under an EMA this dict is the running average, not a temporary
+            target_gradient.clear()
         self._cg_residuals = []  # filled by the CG loop, read by _log_advantage_viz
         a = advantages.float()
         projected = bool(self.args.score_norm_probes)

@@ -210,6 +210,12 @@ class OPSFTConfig(_BaseConfig):
             bounds the amplification of tokens whose score norm is small or badly estimated. Large values recover the
             undamped advantages up to a scale, so the diagnostics can be logged without changing the update direction.
             Unused when `score_norm_probes` is `0`.
+        sft_gradient_ema (`float`, *optional*, defaults to `0.0`):
+            Exponential moving average coefficient for the SFT gradient the advantages project onto, averaging the
+            target over roughly `1 / (1 - sft_gradient_ema)` generation batches instead of estimating it from one.
+            `0` uses the current batch's gradient. It costs no extra pass, only one resident parameter-sized buffer;
+            that buffer holds the parameter dtype, so in bf16 a coefficient much above `0.99` moves it by less than
+            one ulp per update and it stops tracking.
         reward_clip_range (`tuple[float, float]`, *optional*):
             Clip range for rewards as (min, max). If `None`, no clipping is applied.
         mask_truncated_completions (`bool`, *optional*, defaults to `False`):
@@ -582,6 +588,14 @@ class OPSFTConfig(_BaseConfig):
         metadata={
             "help": "Damping added to the estimated squared score norms before dividing, as a fraction of their batch "
             "mean. Large values recover the undamped advantages up to a scale. Unused when `score_norm_probes` is `0`."
+        },
+    )
+    sft_gradient_ema: float = field(
+        default=0.0,
+        metadata={
+            "help": "Exponential moving average coefficient for the SFT gradient the advantages project onto, "
+            "averaging the target over roughly 1 / (1 - sft_gradient_ema) generation batches. `0` uses the current "
+            "batch's gradient. Costs one resident parameter-sized buffer and no extra pass."
         },
     )
     reward_clip_range: tuple[float, float] | None = field(
