@@ -1148,9 +1148,7 @@ class OPSFTTrainer(_BaseTrainer):
                 )
                 target_gradient = self.compute_sft_gradient(rows)
                 if self.args.sft_gradient_ema:
-                    # One batch of gold completions is a noisy estimate of the direction the advantages are
-                    # supposed to project onto. Averaging it costs no pass -- the batch gradient is computed
-                    # either way -- but the running copy stays resident, which is why it is opt-in.
+                    # Averaging costs no pass, only the resident copy, which is why it is opt-in.
                     if self._sft_gradient is None:
                         self._sft_gradient = target_gradient  # nothing to average with on the first round
                     else:
@@ -2124,14 +2122,20 @@ class OPSFTTrainer(_BaseTrainer):
             # r^T M^-1 r after each iteration. Already reduced, so recording it is free, and it is
             # the only honest answer to "are `steps` enough": flat means the solve is not moving.
             self._cg_residuals = [rz.item()]
+            # The matvec is inexact enough that the last iterate is often not the one that got furthest.
+            best = None
             for _ in range(steps):
                 Kp = matvec(p)
                 alpha = rz / self.accelerator.reduce((p * Kp).sum(), reduction="sum")
                 c, r = c + alpha * p, r - alpha * Kp
                 z = r / precond
                 rz_next = self.accelerator.reduce((r * z).sum(), reduction="sum")
+                if best is None or rz_next < best[0]:
+                    best = (rz_next, c)
                 p, rz = z + (rz_next / rz) * p, rz_next
                 self._cg_residuals.append(rz.item())
+            if self.args.score_projection_best_iterate:
+                c = best[1]
             res = self._cg_residuals
             self._metrics[mode]["advantages/cg_residual_ratio"].append(res[-1] / max(res[0], 1e-30))
         else:

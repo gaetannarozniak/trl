@@ -16,12 +16,9 @@ REPO=/storage/home/gaetan/projects/trl
 LOGS=${LOGS:-$HOME/slurm_logs}
 PARTITION=${PARTITION:-h200}
 ACCOUNT=${ACCOUNT:-scientific-reasoning}
-# Not h200_dev: it caps a job at 24h of wall and a user at 16 GPUs, and a run needs neither cap.
-# The project QOS has no wall of its own, so the ceiling is the partition's 7 days.
+# Not h200_dev: it caps a job at 24h and a user at 16 GPUs. The partition ceiling is 7 days.
 QOS=${QOS:-h200_scientific-reasoning_high}
-# 13900 steps at ~60 s each is out of reach at any wall clock, so TIME is what actually decides how
-# long a run trains and every healthy run ends as TIMEOUT. 96h buys ~5700 steps, comfortably past
-# the ~3000 where the eval curves have separated.
+# 13900 steps is out of reach at any wall clock, so TIME decides run length; healthy runs TIMEOUT.
 TIME=${TIME:-96:00:00}
 
 if [ -z "${SLURM_JOB_ID:-}" ]; then
@@ -50,11 +47,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 
-# Every rank calls load_dataset(), which takes a FileLock inside the NFS-backed HF cache. Slurm
-# releases a whole sweep in the same second, and the create/unlink race on that lock file hands
-# ESTALE to whoever loses -- it killed 13 of 20 jobs two minutes in. $RANDOM rather than anything
-# derived from SLURM_JOB_ID: the ids of a sweep are consecutive, so a modulus of them stays
-# consecutive and spreads nothing.
+# load_dataset() takes a FileLock on NFS; a sweep starting in one second gets ESTALE. Spread it.
 sleep $((RANDOM % ${STAGGER:-240}))
 
 "$REPO/.venv/bin/accelerate" launch \

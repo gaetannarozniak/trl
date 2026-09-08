@@ -89,6 +89,19 @@ parser.add_argument(
     "count, is what caps how close the solve gets: 1e-2 saturates immediately, 1e-6 keeps improving to ~8 steps.",
 )
 parser.add_argument(
+    "--score-projection-best-iterate",
+    action="store_true",
+    help="opsft only. Keep the conjugate-gradient iterate with the smallest residual rather than the last one. Same "
+    "number of iterations, same cost: the matvec is inexact enough that the last iterate is often not the best.",
+)
+parser.add_argument(
+    "--sft-gradient-ema",
+    type=float,
+    default=0.0,
+    help="opsft only. Average the SFT target gradient over generation batches with this EMA coefficient rather than "
+    "taking the current batch's. Costs no extra pass, but keeps one parameter-sized buffer resident. `0` disables.",
+)
+parser.add_argument(
     "--init-from",
     default=None,
     help="Path to a checkpoint whose weights start the run, e.g. a checkpoint-25 left by an earlier "
@@ -146,6 +159,10 @@ def run_name():
             parts.append(f"proj{cli.score_projection_steps}")
             if cli.score_norm_damping != parser.get_default("score_norm_damping"):
                 parts.append(f"damp{fmt(cli.score_norm_damping)}")
+            if cli.score_projection_best_iterate:
+                parts.append("best")
+    if cli.trainer == "opsft" and cli.sft_gradient_ema:
+        parts.append(f"ema{fmt(cli.sft_gradient_ema)}")
     return "_".join(parts)
 
 
@@ -165,9 +182,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 print(f"Imports done after {time.time() - t}")
 
 MODEL = "allenai/Olmo-3-1025-7B"
-# Where the weights start. MODEL keeps pointing at the pretrained base everywhere else on purpose:
-# it is what OnPolicyKL measures drift against, so `eval/on_policy_kl` still means distance from the
-# base model in a continuation rather than distance from the checkpoint it happens to resume.
+# MODEL stays the pretrained base elsewhere: it is what OnPolicyKL measures drift against.
 INIT = cli.init_from or MODEL
 tok = AutoTokenizer.from_pretrained(MODEL)
 
@@ -275,18 +290,14 @@ class LeanEval(TrainerCallback):
 
             def make_cfg():
                 return LeanREPLConfig(
-                    # auto_build takes a FileLock on `{WS}.lock` -- one file shared by every rank of
-                    # every job on the cluster, on NFS. A sweep reaching its first eval together
-                    # races create against unlink on that inode and the losers get ESTALE. The
-                    # workspace is built once, by hand, so there is nothing for the lock to guard.
+                    # auto_build takes a FileLock on `{WS}.lock`, shared cluster-wide: ESTALE under a sweep.
                     project=LocalProject(directory=WS, auto_build=False),
                     local_repl_path=f"{WS}/.lake/packages/REPL",  # capitalised at the v4.15 tag
                     lake_path="/home/gaetan/.elan/bin/lake",
                     build_repl=False,
                 )
 
-            # No rank-0-goes-first dance any more: it guarded `lake exe cache get` unpacking into
-            # the shared ~/.cache/mathlib, and auto_build=False means nothing unpacks anything.
+            # No rank-0-first dance: auto_build=False means nothing unpacks into ~/.cache/mathlib.
             cfg = make_cfg()
 
             self.pool = LeanServerPool(cfg, num_workers=self.num_workers)
@@ -462,9 +473,7 @@ common = dict(
     report_to="wandb",
     run_name=EXPE,
     save_strategy="no",  # --save-steps drives the only checkpoints these runs write
-    # A 7B checkpoint is 14 GiB of weights against ~84 GiB of fp32 master copy and Adam moments, and
-    # nothing resumes these runs -- the next stage starts a new trainer from the weights.
-    save_only_model=True,
+    save_only_model=True,  # 14 GiB of weights against ~98 with the optimizer; nothing resumes these
     seed=cli.seed,
     bf16=True,
     per_device_train_batch_size=8,
@@ -497,10 +506,9 @@ if cli.trainer == "opsft":
         score_norm_probes=cli.score_norm_probes,
         score_projection_steps=cli.score_projection_steps,
         score_norm_damping=cli.score_norm_damping,
-        # Each projection step is a full backward, so the activations of an uncheckpointed one are
-        # paid j times over -- and next to vLLM's reserved fraction there is no room for them. Not
-        # conditioned on the step count: with vLLM holding its share, even the runs that do no
-        # projection at all OOM on step 0 without it.
+        score_projection_best_iterate=cli.score_projection_best_iterate,
+        sft_gradient_ema=cli.sft_gradient_ema,
+        # Next to vLLM's reserved fraction, uncheckpointed activations OOM on step 0 at any step count.
         gradient_checkpointing=True,
     )
 else:

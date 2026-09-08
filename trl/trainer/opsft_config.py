@@ -210,6 +210,11 @@ class OPSFTConfig(_BaseConfig):
             bounds the amplification of tokens whose score norm is small or badly estimated. Large values recover the
             undamped advantages up to a scale, so the diagnostics can be logged without changing the update direction.
             Unused when `score_norm_probes` is `0`.
+        score_projection_best_iterate (`bool`, *optional*, defaults to `False`):
+            Take the conjugate-gradient iterate with the smallest residual rather than the last one. The number of
+            iterations is unchanged, so this costs nothing; only which iterate is kept differs. The matvec is
+            symmetric only up to bf16 and up to the attention kernel each of its halves runs under, and past the
+            residual floor that error sets the iteration amplifies it. Unused when `score_projection_steps` is `0`.
         sft_gradient_ema (`float`, *optional*, defaults to `0.0`):
             Exponential moving average coefficient for the SFT gradient the advantages project onto, averaging the
             target over roughly `1 / (1 - sft_gradient_ema)` generation batches instead of estimating it from one.
@@ -588,6 +593,14 @@ class OPSFTConfig(_BaseConfig):
         metadata={
             "help": "Damping added to the estimated squared score norms before dividing, as a fraction of their batch "
             "mean. Large values recover the undamped advantages up to a scale. Unused when `score_norm_probes` is `0`."
+        },
+    )
+    score_projection_best_iterate: bool = field(
+        default=False,
+        metadata={
+            "help": "Take the conjugate-gradient iterate with the smallest residual rather than the last one. Same "
+            "number of iterations and same cost; only which iterate is kept differs. Unused when "
+            "`score_projection_steps` is `0`."
         },
     )
     sft_gradient_ema: float = field(
