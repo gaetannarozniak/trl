@@ -422,15 +422,16 @@ class OnPolicyKL(TrainerCallback):
     OPSFT comparable on it. A KL over the *gold* tokens would be pointless here: it equals
     base_nll - eval_loss exactly, so it carries nothing the eval loss does not already.
 
-    It reuses the completions LeanEval has just produced, so the only extra work is one forward of
-    the frozen base model. Those are greedy (see `_generate`), so this measures drift of the greedy
-    mode; OPSFTTrainer's own `kl` averages over temperature-1.0 samples. Trends are comparable
-    between the two trainers, the absolute value is not comparable to `train/kl`.
+    It reuses the completions LeanEval has just produced, so the only extra work is loading the
+    frozen base model and running one forward of it. Those are greedy (see `_generate`), so this
+    measures drift of the greedy mode; OPSFTTrainer's own `kl` averages over temperature-1.0
+    samples. Trends are comparable between the two trainers, the absolute value is not comparable
+    to `train/kl`.
     """
 
     def __init__(self, tok, lean_eval):
         self.tok, self.lean_eval = tok, lean_eval
-        self.base, self.trainer = None, None
+        self.trainer = None
 
     def _sum_logps(self, model, prompts, completions):
         """(sum of log pi over the completion tokens, how many there were)."""
@@ -451,19 +452,19 @@ class OnPolicyKL(TrainerCallback):
     def on_evaluate(self, args, state, control, model=None, **kwargs):
         if model is None or self.lean_eval.last is None:
             return
-        if self.base is None:
-            # Lazily loaded: a second copy of the model is 14 GB, so a run that never evaluates
-            # never pays for it.
-            self.base = AutoModelForCausalLM.from_pretrained(
-                MODEL, dtype=torch.bfloat16, device_map={"": model.device}
-            ).eval()
-            self.base.requires_grad_(False)
-
         prompts, completions = self.lean_eval.last
         model.eval()
         theta, n = self._sum_logps(model, prompts, completions)
-        base, _ = self._sum_logps(self.base, prompts, completions)
         model.train()
+
+        # Loaded and dropped here, ~1 min per eval: the 14 GB a resident copy holds between evals is
+        # what OOMs the runs that also keep an --sft-gradient-ema buffer.
+        base_model = AutoModelForCausalLM.from_pretrained(
+            MODEL, dtype=torch.bfloat16, device_map={"": model.device}
+        ).eval()
+        base, _ = self._sum_logps(base_model, prompts, completions)
+        del base_model
+        torch.cuda.empty_cache()
 
         # Every rank scores its own shard; sum both accumulators so the ratio is the token-mean over
         # the whole eval set rather than a per-rank average of per-rank means.
