@@ -225,6 +225,13 @@ class OPSFTConfig(_BaseConfig):
             `0` uses the current batch's gradient. It costs no extra pass, only one resident parameter-sized buffer;
             that buffer holds the parameter dtype, so in bf16 a coefficient much above `0.99` moves it by less than
             one ulp per update and it stops tracking.
+        sft_gradient_per_example (`bool`, *optional*, defaults to `False`):
+            Score each completion against the gradient of *its own* gold completion rather than against the batch
+            average, so the advantages measure whether a token moves the policy toward the proof that prompt actually
+            has. The whole advantage pipeline then runs one row at a time, which is the same arithmetic split into
+            smaller passes: the total cost is unchanged in FLOPs, the peak activation memory drops by the batch size,
+            and the cross-rank reductions disappear, since no two ranks share a prompt. Incompatible with
+            `sft_gradient_ema`, which averages a target that no longer stays fixed from one step to the next.
         reward_clip_range (`tuple[float, float]`, *optional*):
             Clip range for rewards as (min, max). If `None`, no clipping is applied.
         mask_truncated_completions (`bool`, *optional*, defaults to `False`):
@@ -622,6 +629,14 @@ class OPSFTConfig(_BaseConfig):
             "batch's gradient. Costs one resident parameter-sized buffer and no extra pass."
         },
     )
+    sft_gradient_per_example: bool = field(
+        default=False,
+        metadata={
+            "help": "Score each completion against the gradient of its own gold completion rather than against the "
+            "batch average. Runs the advantage pipeline one row at a time: same FLOPs, less peak memory, no "
+            "cross-rank reduction. Incompatible with `sft_gradient_ema`."
+        },
+    )
     reward_clip_range: tuple[float, float] | None = field(
         default=None,
         metadata={"help": "Clip range for rewards as (min, max). If None, no clipping is applied."},
@@ -716,6 +731,12 @@ class OPSFTConfig(_BaseConfig):
             raise ValueError(
                 "`score_projection_steps` needs `score_norm_probes > 0`: the probes estimate the score norms that "
                 "precondition the conjugate-gradient solve, without which it barely converges."
+            )
+
+        if self.sft_gradient_per_example and self.sft_gradient_ema:
+            raise ValueError(
+                "`sft_gradient_per_example` and `sft_gradient_ema` are mutually exclusive: a per-prompt target is a "
+                "different vector at every step, so there is nothing for the running average to track."
             )
 
         if self.use_transformers_paged:

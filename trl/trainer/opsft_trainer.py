@@ -582,6 +582,8 @@ class OPSFTTrainer(_BaseTrainer):
         self._buffered_inputs = None
         # Running average of the SFT gradient under `sft_gradient_ema`; parameter-sized, so it stays None otherwise.
         self._sft_gradient = None
+        # True while the advantage pipeline is running on a single row under `sft_gradient_per_example`.
+        self._per_example = False
 
         # Transformers explicitly set use_reentrant=True in the past to silence a PyTorch warning, but the default was
         # never updated once PyTorch switched to recommending use_reentrant=False. Until that change lands upstream
@@ -1108,8 +1110,9 @@ class OPSFTTrainer(_BaseTrainer):
         )
 
         # Every rank holds a different slice of the batch, so average to give them all the same
-        # global SFT direction to project onto.
-        if self.accelerator.num_processes > 1:
+        # global SFT direction to project onto. Per-example, the target belongs to one prompt on one
+        # rank and averaging it with the others is exactly what the option exists to avoid.
+        if self.accelerator.num_processes > 1 and not self._per_example:
             for v in target_gradient.values():
                 dist.all_reduce(v)
                 v /= self.accelerator.num_processes
@@ -1148,20 +1151,44 @@ class OPSFTTrainer(_BaseTrainer):
                 attention_mask = torch.cat(
                     [generation_batch["prompt_mask"], generation_batch["completion_mask"]], dim=1
                 )
-                target_gradient = self.compute_sft_gradient(rows)
-                if self.args.sft_gradient_ema:
-                    # Averaging costs no pass, only the resident copy, which is why it is opt-in.
-                    if self._sft_gradient is None:
-                        self._sft_gradient = target_gradient  # nothing to average with on the first round
-                    else:
-                        for name, avg in self._sft_gradient.items():
-                            avg.lerp_(target_gradient[name], 1 - self.args.sft_gradient_ema)
-                    target_gradient = self._sft_gradient
-                generation_batch["advantages"] = self._compute_opsft_advantages(
-                    target_gradient, input_ids, attention_mask, generation_batch["completion_ids"].size(1)
-                )
+                logits_to_keep = generation_batch["completion_ids"].size(1)
+                if self.args.sft_gradient_per_example:
+                    # The same pipeline, one row at a time: 1/B of the tokens per pass, B passes.
+                    self._per_example = True
+                    advantages = torch.cat(
+                        [
+                            self._compute_opsft_advantages(
+                                self.compute_sft_gradient(rows[i : i + 1]),
+                                input_ids[i : i + 1],
+                                attention_mask[i : i + 1],
+                                logits_to_keep,
+                            )
+                            for i in range(len(rows))
+                        ]
+                    )
+                    self._per_example = False
+                    # Each row's target is its own share of the batch mean, not the whole of it: the
+                    # advantages are linear in the target, and without this the update the loss
+                    # applies is `global batch size` times the one the batched path applies.
+                    generation_batch["advantages"] = advantages / (
+                        input_ids.size(0) * self.accelerator.num_processes
+                    )
+                else:
+                    target_gradient = self.compute_sft_gradient(rows)
+                    if self.args.sft_gradient_ema:
+                        # Averaging costs no pass, only the resident copy, which is why it is opt-in.
+                        if self._sft_gradient is None:
+                            self._sft_gradient = target_gradient  # nothing to average with on the first round
+                        else:
+                            for name, avg in self._sft_gradient.items():
+                                avg.lerp_(target_gradient[name], 1 - self.args.sft_gradient_ema)
+                        target_gradient = self._sft_gradient
+                    generation_batch["advantages"] = self._compute_opsft_advantages(
+                        target_gradient, input_ids, attention_mask, logits_to_keep
+                    )
+                    del target_gradient
                 self._gold_rows = rows  # the natural-gradient loss needs them again in compute_loss
-                del target_gradient, rows
+                del rows
                 self._log_advantage_viz(generation_batch)
 
                 generation_batch = split_pixel_values_by_grid(generation_batch)
@@ -1889,10 +1916,14 @@ class OPSFTTrainer(_BaseTrainer):
         u = u * attention_mask[:, -completion_ids.size(1) :]
         grads = torch.autograd.grad((u * logps).sum(), plist)
         del logits, logps
-        if self.accelerator.num_processes > 1:
+        if self.accelerator.num_processes > 1 and not self._per_example:
             for v in grads:
                 dist.all_reduce(v)  # SUM, not mean: the other ranks own the rest of the tokens of G
         return dict(zip(names, grads))
+
+    def _reduce(self, tensor):
+        """Sum across ranks, except per-example: there G spans one row on one rank and nothing couples them."""
+        return tensor if self._per_example else self.accelerator.reduce(tensor, reduction="sum")
 
     def _score_matvec(self, u, base, f, params, input_ids, attention_mask, completion_ids):
         """K u = G G^T u, the Gram matrix of the score vectors applied to `u`."""
@@ -2059,7 +2090,7 @@ class OPSFTTrainer(_BaseTrainer):
         del update
         # <g_sft, G^T c> = c . (G g_sft) = c . a, so the SFT gradient need not still be around.
         mask = attention_mask[:, -completion_ids.size(1) :]
-        dot = self.accelerator.reduce((c * a * mask).sum(), reduction="sum")
+        dot = self._reduce((c * a * mask).sum())
         cos = (dot / (update_sq * sft_sq).sqrt()).clamp(-1.0, 1.0)
         mode = "train" if self.model.training else "eval"
         self._metrics[mode]["advantages/sft_angle_deg"].append(torch.rad2deg(cos.arccos()).item())
@@ -2108,11 +2139,16 @@ class OPSFTTrainer(_BaseTrainer):
         probes, advantages = torch.stack(probes), advantages.float()
         squares = probes.pow(2)
         score_norms_sq = squares.mean(0)
-        totals = self.accelerator.reduce(torch.stack([(score_norms_sq * mask).sum(), mask.sum()]), reduction="sum")
+        totals = self._reduce(torch.stack([(score_norms_sq * mask).sum(), mask.sum()]))
         damping = self.args.score_norm_damping * totals[0] / totals[1]
         precond = score_norms_sq + damping
         a = advantages * mask
         mode = "train" if self.model.training else "eval"
+        # Everything below stays inside the masked coordinates, so the system has one dimension per
+        # completion token and CG solves it exactly in that many steps. Asking for more is asking it
+        # to divide a zero residual by itself, which a short row under `sft_gradient_per_example`
+        # does reach: a two-token completion is a two-dimensional solve.
+        steps = min(steps, int(totals[1].item()))
 
         if steps:
             matvec = lambda u: (
@@ -2121,22 +2157,29 @@ class OPSFTTrainer(_BaseTrainer):
             )
             c, r = torch.zeros_like(a), a.clone()
             z = r / precond
-            p, rz = z.clone(), self.accelerator.reduce((r * z).sum(), reduction="sum")
+            p, rz = z.clone(), self._reduce((r * z).sum())
             # r^T M^-1 r after each iteration. Already reduced, so recording it is free, and it is
             # the only honest answer to "are `steps` enough": flat means the solve is not moving.
             self._cg_residuals = [rz.item()]
             # The matvec is inexact enough that the last iterate is often not the one that got furthest.
-            best = None
+            best = (rz, c)
             for _ in range(steps):
                 Kp = matvec(p)
-                alpha = rz / self.accelerator.reduce((p * Kp).sum(), reduction="sum")
+                pKp = self._reduce((p * Kp).sum())
+                # K + damping I is positive definite, so a non-positive pKp is the inexact matvec
+                # having driven the residual into its own noise floor; there is nothing left to solve.
+                if pKp <= 0:
+                    break
+                alpha = rz / pKp
                 c, r = c + alpha * p, r - alpha * Kp
                 z = r / precond
-                rz_next = self.accelerator.reduce((r * z).sum(), reduction="sum")
-                if best is None or rz_next < best[0]:
+                rz_next = self._reduce((r * z).sum())
+                if rz_next < best[0]:
                     best = (rz_next, c)
+                self._cg_residuals.append(rz_next.item())
+                if rz_next <= 0:
+                    break
                 p, rz = z + (rz_next / rz) * p, rz_next
-                self._cg_residuals.append(rz.item())
             if self.args.score_projection_best_iterate:
                 c = best[1]
             res = self._cg_residuals

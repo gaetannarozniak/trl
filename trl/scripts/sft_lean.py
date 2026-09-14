@@ -108,6 +108,12 @@ parser.add_argument(
     "taking the current batch's. Costs no extra pass, but keeps one parameter-sized buffer resident. `0` disables.",
 )
 parser.add_argument(
+    "--sft-gradient-per-example",
+    action="store_true",
+    help="opsft only. Score each completion against the gradient of its own gold proof rather than the batch "
+    "average, so a token's advantage says whether it moves toward the proof its own prompt has. Same FLOPs.",
+)
+parser.add_argument(
     "--init-from",
     default=None,
     help="Path to a checkpoint whose weights start the run, e.g. a checkpoint-25 left by an earlier "
@@ -183,6 +189,8 @@ def run_name():
         parts.append("natgrad")
     if cli.trainer == "opsft" and cli.sft_gradient_ema:
         parts.append(f"ema{fmt(cli.sft_gradient_ema)}")
+    if cli.trainer == "opsft" and cli.sft_gradient_per_example:
+        parts.append("perex")
     return "_".join(parts)
 
 
@@ -533,6 +541,7 @@ if cli.trainer == "opsft":
         natural_gradient=cli.natural_gradient,
         score_projection_best_iterate=cli.score_projection_best_iterate,
         sft_gradient_ema=cli.sft_gradient_ema,
+        sft_gradient_per_example=cli.sft_gradient_per_example,
         # Next to vLLM's reserved fraction, uncheckpointed activations OOM on step 0 at any step count.
         gradient_checkpointing=True,
     )
