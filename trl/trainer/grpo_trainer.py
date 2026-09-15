@@ -353,7 +353,17 @@ class GRPOTrainer(_BaseTrainer):
                     "You passed `quantization_config` to the trainer, but your model is already instantiated. The "
                     "`quantization_config` will be ignored."
                 )
-        model.value_head = nn.Sequential(nn.Linear(model.config.hidden_size, 1, dtype=model.dtype), nn.Tanh())
+        # Critic: its own copy of the backbone (no weight sharing with the policy) plus a scalar head. Attached to
+        # `model` so the Trainer handles its optimizer params, device placement, DDP wrapping and checkpointing.
+        model.critic = nn.ModuleDict(
+            {
+                "backbone": copy.deepcopy(model.base_model),
+                "head": nn.Sequential(nn.Linear(model.config.hidden_size, 1, dtype=model.dtype), nn.Tanh()),
+            }
+        )
+        if args.zero_init_value_head:
+            nn.init.zeros_(model.critic["head"][0].weight)
+            nn.init.zeros_(model.critic["head"][0].bias)
         # Non-quantized models do not have the `is_loaded_in_{8,4}bit` attributes, whereas quantized models do
         _is_quantized_model = getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False)
 
@@ -933,11 +943,6 @@ class GRPOTrainer(_BaseTrainer):
                     f"'token_mask'. Got: {self.vllm_importance_sampling_mode}."
                 )
 
-        self.only_train_value_function = args.only_train_value_function
-        if self.only_train_value_function:
-            for name, param in model.named_parameters():
-                param.requires_grad = name.startswith("value_head.")
-
         # Multi-step
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
         self.epsilon_low = args.epsilon
@@ -1131,12 +1136,12 @@ class GRPOTrainer(_BaseTrainer):
             # The vLLM model has no value head, so exclude it from the weight sync
             _iter_named_params = self.vllm_generation._iter_named_params
 
-            def _iter_named_params_without_value_head():
+            def _iter_named_params_without_critic():
                 for name, param in _iter_named_params():
-                    if not name.startswith("value_head."):
+                    if not name.startswith("critic."):
                         yield name, param
 
-            self.vllm_generation._iter_named_params = _iter_named_params_without_value_head
+            self.vllm_generation._iter_named_params = _iter_named_params_without_critic
 
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
         else:
@@ -1475,7 +1480,6 @@ class GRPOTrainer(_BaseTrainer):
         batch_size=None,
         compute_entropy=False,
         compute_aux_loss=False,
-        compute_values=False,
         pixel_values=None,
         image_grid_thw=None,
         num_images=None,
@@ -1486,19 +1490,9 @@ class GRPOTrainer(_BaseTrainer):
         token_type_ids=None,
         mm_token_type_ids=None,
         image_position_ids=None,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
-        | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]
-    ):
-        """Compute log-probs, (optionally) entropies, and the MoE load-balancing aux loss.
-
-        Values from the value head are appended as a fourth element only when `compute_values=True`, so existing
-        callers keep unpacking three.
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Compute log-probs, (optionally) entropies, and (optionally) the MoE load-balancing aux loss."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
-        # `model` may be DDP-wrapped, which does not forward attribute access to the wrapped module
-        value_head = self.accelerator.unwrap_model(model).value_head if compute_values else None
-        all_values = []
         all_logps = []
         all_entropies = []
         all_aux_losses = []
@@ -1560,21 +1554,12 @@ class GRPOTrainer(_BaseTrainer):
             if compute_aux_loss:
                 model_inputs["output_router_logits"] = True
 
-            if compute_values:
-                model_inputs["output_hidden_states"] = True
-
             outputs = model(**model_inputs)
             logits = outputs.logits
             # Exclude the last value: it corresponds to the next token pred
             logits = logits[:, :-1, :]  # (B, L-1, H)
             # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
             logits = logits[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
-
-            if compute_values:
-                # values[:, :-1] aligns with logps; values[:, -1] is the bootstrap value of the state
-                # reached after the last completion token.
-                hidden = outputs.hidden_states[-1][:, -(logits_to_keep + 1) :, :]
-                all_values.append(value_head(hidden).squeeze(-1))  # (B, logits_to_keep + 1)
 
             # Divide logits by sampling temperature.
             # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
@@ -1600,9 +1585,70 @@ class GRPOTrainer(_BaseTrainer):
         logps = torch.cat(all_logps, dim=0)
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
         aux_loss = torch.stack(all_aux_losses).mean() if compute_aux_loss else None
-        if compute_values:
-            return logps, entropies, aux_loss, torch.cat(all_values, dim=0)
         return logps, entropies, aux_loss
+
+    def _get_values(self, model, input_ids, attention_mask, logits_to_keep):
+        """Per-token values from the critic, which has its own backbone and shares no weights with the policy.
+
+        `values[:, :-1]` aligns with the completion tokens; `values[:, -1]` is the bootstrap value of the state
+        reached after the last one.
+        """
+        # `model` may be DDP-wrapped, which does not forward attribute access to the wrapped module
+        critic = self.accelerator.unwrap_model(model).critic
+        hidden = critic["backbone"](input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        return critic["head"](hidden[:, -(logits_to_keep + 1) :, :]).squeeze(-1)  # (B, logits_to_keep + 1)
+
+    def _critic_params(self, model):
+        critic_ids = {id(p) for p in self.accelerator.unwrap_model(model).critic.parameters()}
+        critic, policy = [], []
+        for p in model.parameters():
+            (critic if id(p) in critic_ids else policy).append(p)
+        return critic, policy
+
+    def create_optimizer(self, model=None):
+        """Move the critic into its own param groups so it can use `critic_learning_rate`."""
+        super().create_optimizer(model)
+        if self.args.critic_learning_rate is None:
+            return self.optimizer
+
+        decay = set(self.get_decay_parameter_names(self.model))
+        critic = {n: p for n, p in self.model.named_parameters() if n.startswith("critic.") and p.requires_grad}
+        critic_ids = {id(p) for p in critic.values()}
+        for group in self.optimizer.param_groups:
+            group["params"] = [p for p in group["params"] if id(p) not in critic_ids]
+        for weight_decay, names in (
+            (self.args.weight_decay, [n for n in critic if n in decay]),
+            (0.0, [n for n in critic if n not in decay]),
+        ):
+            if names:
+                self.optimizer.add_param_group(
+                    {
+                        "params": [critic[n] for n in names],
+                        "lr": self.args.critic_learning_rate,
+                        "weight_decay": weight_decay,
+                    }
+                )
+        return self.optimizer
+
+    def _clip_grad_norm(self, model):
+        """Clip the critic separately from the policy, so neither affects the other's grad norm.
+
+        Clipping them together would rescale the policy's gradients by a factor that depends on the critic's, which
+        would make the two optimizations interact.
+        """
+        critic, policy = self._critic_params(model)
+        critic_max_grad_norm = self.args.critic_max_grad_norm
+        if critic_max_grad_norm is None:
+            critic_max_grad_norm = self.args.max_grad_norm
+        self.accelerator.clip_grad_norm_(critic, critic_max_grad_norm)
+        return self.accelerator.clip_grad_norm_(policy, self.args.max_grad_norm)
+
+    def _get_grad_norm(self, model, grad_norm=None):
+        """Report the policy's gradient norm, excluding the critic."""
+        if grad_norm is None:
+            _, policy = self._critic_params(model)
+            grad_norm = self.accelerator.clip_grad_norm_(policy, float("inf"))
+        return super()._get_grad_norm(model, grad_norm=grad_norm)
 
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
@@ -3165,14 +3211,13 @@ class GRPOTrainer(_BaseTrainer):
         mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
 
         # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies, aux_loss, values = self._get_per_token_logps_and_entropies(
+        per_token_logps, entropies, aux_loss = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
             attention_mask,
             logits_to_keep,
             compute_entropy=True,
             compute_aux_loss=self.aux_loss_enabled,
-            compute_values=True,
             pixel_values=inputs.get("pixel_values"),
             image_grid_thw=inputs.get("image_grid_thw"),
             num_images=inputs.get("num_images"),
@@ -3185,18 +3230,9 @@ class GRPOTrainer(_BaseTrainer):
             image_position_ids=inputs.get("image_position_ids"),
         )
 
+        values = self._get_values(model, input_ids, attention_mask, logits_to_keep)
         value_target = inputs["unnormalized_advantages"].unsqueeze(-1)  # (B, 1), broadcast over tokens
         value_loss = ((values[:, :-1] - value_target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
-
-        if self.only_train_value_function:
-            mode = "train" if self.model.training else "eval"
-            # Same quantity with the value head predicting 0 everywhere
-            baseline_value_loss = (value_target**2 * mask).sum() / mask.sum().clamp(min=1.0)
-            self._metrics[mode]["value_loss"].append(self.accelerator.gather(value_loss.detach()).mean().item())
-            self._metrics[mode]["baseline_value_loss"].append(
-                self.accelerator.gather(baseline_value_loss.detach()).mean().item()
-            )
-            return value_loss / (self.current_gradient_accumulation_steps if mode == "train" else 1.0)
 
         if self.top_entropy_quantile < 1.0:
             entropy_mask = self.get_high_entropy_mask(entropies, mask, 1 - self.top_entropy_quantile)
@@ -3401,6 +3437,17 @@ class GRPOTrainer(_BaseTrainer):
             normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0
             loss = loss + self.router_aux_loss_coef * aux_loss / normalizer
             self._metrics[mode]["aux_loss"].append(self.accelerator.gather_for_metrics(aux_loss).mean().item())
+
+        # The critic shares no weights with the policy, so this term only reaches critic parameters. Scaled by the
+        # accumulation factor only (like the entropy bonus), never by a loss-type-specific policy normalizer.
+        accumulation_factor = self.current_gradient_accumulation_steps if mode == "train" else 1.0
+        loss = loss + value_loss / accumulation_factor
+        # Same quantity with the critic predicting 0 everywhere, as a reference point for value_loss
+        baseline_value_loss = (value_target**2 * mask).sum() / mask.sum().clamp(min=1.0)
+        self._metrics[mode]["value_loss"].append(self.accelerator.gather(value_loss.detach()).mean().item())
+        self._metrics[mode]["baseline_value_loss"].append(
+            self.accelerator.gather(baseline_value_loss.detach()).mean().item()
+        )
 
         # Log the metrics
         def masked_seq_mean(x):

@@ -13,14 +13,20 @@
 
 set -euo pipefail
 
-# usage: sbatch my_grpo.sbatch RUN_NAME [extra args forwarded to my_grpo.py]
-NAME=${1:?usage: sbatch my_grpo.sbatch RUN_NAME [args...]}
-shift
-scontrol update JobId="$SLURM_JOB_ID" JobName="$NAME"
+# All args are forwarded untouched; --run_name is also reused as the Slurm job name.
+ARGS=("$@")
+NAME=""
+for i in "${!ARGS[@]}"; do
+    case "${ARGS[i]}" in
+        --run_name | --run-name) NAME="${ARGS[i + 1]:-}" ;;
+        --run_name=* | --run-name=*) NAME="${ARGS[i]#*=}" ;;
+    esac
+done
+[ -n "$NAME" ] && scontrol update JobId="$SLURM_JOB_ID" JobName="$NAME"
 
 cd /storage/home/gaetan/projects/trl
 source .venv/bin/activate
 
-echo "job $SLURM_JOB_ID ($NAME) on $(hostname) | gpus=$SLURM_GPUS_ON_NODE cpus=$SLURM_CPUS_ON_NODE"
+echo "job $SLURM_JOB_ID (${NAME:-unnamed}) on $(hostname) | gpus=$SLURM_GPUS_ON_NODE cpus=$SLURM_CPUS_ON_NODE"
 
-accelerate launch --num_processes 4 trl/scripts/my_grpo.py --run_name "$NAME" "$@"
+accelerate launch --num_processes 4 trl/scripts/my_grpo.py "$@"

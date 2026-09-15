@@ -174,9 +174,14 @@ class GRPOConfig(_BaseConfig):
             learning](https://huggingface.co/papers/2501.12948) use a value of `0.001`.
         num_iterations (`int`, *optional*, defaults to `1`):
             Number of iterations per batch (denoted as μ in the algorithm).
-        only_train_value_function (`bool`, *optional*, defaults to `False`):
-            Whether to train only the value head, keeping the policy frozen. The loss is then the value loss alone.
-            Useful to fit the value function against a fixed policy before enabling joint training.
+        critic_learning_rate (`float`, *optional*):
+            Learning rate for the critic. If `None` (default), the critic uses `learning_rate` like the policy.
+        critic_max_grad_norm (`float`, *optional*):
+            Max gradient norm for the critic. The critic is always clipped separately from the policy, so that
+            neither rescales the other's gradients. If `None` (default), `max_grad_norm` is used as the threshold.
+        zero_init_value_head (`bool`, *optional*, defaults to `False`):
+            Whether to zero-initialize the critic's linear value head, so that it predicts exactly 0 everywhere at
+            the start of training instead of arbitrary values.
         epsilon (`float`, *optional*, defaults to `0.2`):
             Epsilon value for clipping.
         delta (`float`, *optional*):
@@ -688,11 +693,25 @@ class GRPOConfig(_BaseConfig):
         default=1,
         metadata={"help": "Number of iterations per batch (denoted as μ in the algorithm)."},
     )
-    only_train_value_function: bool = field(
+    critic_learning_rate: float | None = field(
+        default=None,
+        metadata={
+            "help": "Learning rate for the critic. If `None` (default), the critic uses `learning_rate` like the "
+            "policy."
+        },
+    )
+    critic_max_grad_norm: float | None = field(
+        default=None,
+        metadata={
+            "help": "Max gradient norm for the critic. The critic is always clipped separately from the policy, "
+            "so that neither rescales the other's gradients. If `None` (default), `max_grad_norm` is used."
+        },
+    )
+    zero_init_value_head: bool = field(
         default=False,
         metadata={
-            "help": "Whether to train only the value head, keeping the policy frozen. The loss is then the value "
-            "loss alone. Useful to fit the value function against a fixed policy before enabling joint training."
+            "help": "Whether to zero-initialize the critic's linear value head, so that it predicts exactly 0 "
+            "everywhere at the start of training instead of arbitrary values."
         },
     )
     epsilon: float = field(

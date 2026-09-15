@@ -19,7 +19,6 @@ DEFAULTS = {
     "save_strategy": "no",
     "use_vllm": True,
     "bf16": True,
-    "only_train_value_function": True,
 }
 
 
