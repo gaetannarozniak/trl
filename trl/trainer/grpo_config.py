@@ -182,6 +182,9 @@ class GRPOConfig(_BaseConfig):
         zero_init_value_head (`bool`, *optional*, defaults to `False`):
             Whether to zero-initialize the critic's linear value head, so that it predicts exactly 0 everywhere at
             the start of training instead of arbitrary values.
+        gae_lambda (`float`, *optional*):
+            If set, the critic regresses on TD(lambda) returns instead of the final reward. `gamma` is 1 and the
+            only reward is terminal, so `1.0` recovers the Monte-Carlo target and `0.0` gives one-step TD.
         epsilon (`float`, *optional*, defaults to `0.2`):
             Epsilon value for clipping.
         delta (`float`, *optional*):
@@ -712,6 +715,13 @@ class GRPOConfig(_BaseConfig):
         metadata={
             "help": "Whether to zero-initialize the critic's linear value head, so that it predicts exactly 0 "
             "everywhere at the start of training instead of arbitrary values."
+        },
+    )
+    gae_lambda: float | None = field(
+        default=None,
+        metadata={
+            "help": "If set, the critic regresses on TD(lambda) returns instead of the final reward. `gamma` is 1 "
+            "and the only reward is terminal, so `1.0` recovers the Monte-Carlo target and `0.0` gives one-step TD."
         },
     )
     epsilon: float = field(

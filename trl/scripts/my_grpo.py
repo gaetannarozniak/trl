@@ -19,6 +19,8 @@ DEFAULTS = {
     "save_strategy": "no",
     "use_vllm": True,
     "bf16": True,
+    "max_completion_length": 2048,
+    "num_generations": 16,
 }
 
 

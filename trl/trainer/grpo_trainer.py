@@ -943,6 +943,8 @@ class GRPOTrainer(_BaseTrainer):
                     f"'token_mask'. Got: {self.vllm_importance_sampling_mode}."
                 )
 
+        self.gae_lambda = args.gae_lambda
+
         # Multi-step
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
         self.epsilon_low = args.epsilon
@@ -1642,6 +1644,46 @@ class GRPOTrainer(_BaseTrainer):
             critic_max_grad_norm = self.args.max_grad_norm
         self.accelerator.clip_grad_norm_(critic, critic_max_grad_norm)
         return self.accelerator.clip_grad_norm_(policy, self.args.max_grad_norm)
+
+    @torch.no_grad()
+    def _gae_returns(self, values, value_target, mask):
+        """TD(lambda) returns, used as the critic's regression target instead of the final reward.
+
+        gamma is 1 and the only reward is the terminal one, so `gae_lambda=1` recovers the plain Monte-Carlo target
+        and `gae_lambda=0` gives one-step TD.
+        """
+        values = values.detach()
+        lengths = mask.sum(dim=1, keepdim=True)
+        positions = torch.arange(mask.size(1), device=mask.device).expand_as(mask)
+        is_last = (positions == lengths - 1).to(values.dtype)
+        # The episode ends once the reward is collected, so the state after the last token has value 0
+        next_values = values[:, 1:] * (1 - is_last) * mask
+        deltas = (value_target * is_last + next_values - values[:, :-1]) * mask
+
+        advantages = torch.zeros_like(deltas)
+        running = torch.zeros_like(deltas[:, 0])
+        for t in range(mask.size(1) - 1, -1, -1):
+            running = deltas[:, t] + self.gae_lambda * running * mask[:, t]
+            advantages[:, t] = running
+        return advantages + values[:, :-1]
+
+    @torch.no_grad()
+    def _log_value_r2(self, values, value_target, mask, mode):
+        """Log the critic's explained variance, overall and in 4 buckets of relative position.
+
+        Unanimous groups are excluded: their target is zero everywhere, so they carry no signal and would only drag
+        the ratio towards 0.
+        """
+        squared_error = (values[:, :-1] - value_target) ** 2
+        signal = value_target**2
+        keep = mask * (value_target.abs() > 1e-8).to(mask.dtype)
+        positions = torch.arange(mask.size(1), device=mask.device).expand_as(mask)
+        bucket = (positions * 4 // mask.sum(dim=1, keepdim=True).clamp(min=1)).clamp(max=3)
+        for suffix, selected in [("", keep)] + [(f"_q{b + 1}", keep * (bucket == b)) for b in range(4)]:
+            error_sum = self.accelerator.gather((squared_error * selected).sum()).sum()
+            signal_sum = self.accelerator.gather((signal * selected).sum()).sum()
+            if signal_sum > 0:
+                self._metrics[mode][f"value_r2{suffix}"].append(1.0 - (error_sum / signal_sum).item())
 
     def _get_grad_norm(self, model, grad_norm=None):
         """Report the policy's gradient norm, excluding the critic."""
@@ -2909,8 +2951,12 @@ class GRPOTrainer(_BaseTrainer):
             rewards = (reward_k * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
             rewards[unscorable_mask] = torch.nan
             std_rewards = nanstd(rewards).expand_as(rewards) if rewards.numel() > 1 else torch.zeros_like(rewards)
-            unnormalized_advantages = rewards - torch.nanmean(rewards)
-            advantages = unnormalized_advantages / (std_rewards + 1e-4)
+            # Centered on the per-prompt group mean (not the batch mean), so the critic target is R - R_bar in
+            # both aggregation modes. The advantage below keeps this mode's batch-level normalization.
+            mean_grouped_rewards = torch.nanmean(rewards.view(-1, num_generations), dim=1)
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
+            unnormalized_advantages = rewards - mean_grouped_rewards
+            advantages = (rewards - torch.nanmean(rewards)) / (std_rewards + 1e-4)
             is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))  # for logging
 
         else:
@@ -2922,6 +2968,11 @@ class GRPOTrainer(_BaseTrainer):
         # Unscorable completions (every reward func returned None) carry no learning signal: their reward is NaN here,
         # so zero their advantage to keep them from moving the policy.
         advantages = torch.nan_to_num(advantages, nan=0.0)
+        # Leave-one-out group mean for the critic target, so a completion is not compared against a mean that
+        # includes itself: R - (sum - R) / (K - 1) = K / (K - 1) * (R - R_bar)
+        if num_generations > 1:
+            unnormalized_advantages = unnormalized_advantages * num_generations / (num_generations - 1)
+        loo_baseline = torch.nan_to_num(rewards - unnormalized_advantages, nan=0.0)
         unnormalized_advantages = torch.nan_to_num(unnormalized_advantages, nan=0.0)
 
         # Slice to keep only the local part of the data
@@ -2932,6 +2983,7 @@ class GRPOTrainer(_BaseTrainer):
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
         unnormalized_advantages = unnormalized_advantages[process_slice]
+        loo_baseline = loo_baseline[process_slice]
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
@@ -3018,6 +3070,7 @@ class GRPOTrainer(_BaseTrainer):
             "advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
             "unnormalized_advantages": unnormalized_advantages,
+            "loo_baseline": loo_baseline,
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
@@ -3232,7 +3285,8 @@ class GRPOTrainer(_BaseTrainer):
 
         values = self._get_values(model, input_ids, attention_mask, logits_to_keep)
         value_target = inputs["unnormalized_advantages"].unsqueeze(-1)  # (B, 1), broadcast over tokens
-        value_loss = ((values[:, :-1] - value_target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
+        regression_target = value_target if self.gae_lambda is None else self._gae_returns(values, value_target, mask)
+        value_loss = ((values[:, :-1] - regression_target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
 
         if self.top_entropy_quantile < 1.0:
             entropy_mask = self.get_high_entropy_mask(entropies, mask, 1 - self.top_entropy_quantile)
@@ -3448,6 +3502,8 @@ class GRPOTrainer(_BaseTrainer):
         self._metrics[mode]["baseline_value_loss"].append(
             self.accelerator.gather(baseline_value_loss.detach()).mean().item()
         )
+
+        self._log_value_r2(values, value_target, mask, mode)
 
         # Log the metrics
         def masked_seq_mean(x):
