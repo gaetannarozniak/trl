@@ -174,6 +174,9 @@ class GRPOConfig(_BaseConfig):
             learning](https://huggingface.co/papers/2501.12948) use a value of `0.001`.
         num_iterations (`int`, *optional*, defaults to `1`):
             Number of iterations per batch (denoted as μ in the algorithm).
+        only_train_value_function (`bool`, *optional*, defaults to `False`):
+            Whether to train only the value head, keeping the policy frozen. The loss is then the value loss alone.
+            Useful to fit the value function against a fixed policy before enabling joint training.
         epsilon (`float`, *optional*, defaults to `0.2`):
             Epsilon value for clipping.
         delta (`float`, *optional*):
@@ -684,6 +687,13 @@ class GRPOConfig(_BaseConfig):
     num_iterations: int = field(
         default=1,
         metadata={"help": "Number of iterations per batch (denoted as μ in the algorithm)."},
+    )
+    only_train_value_function: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to train only the value head, keeping the policy frozen. The loss is then the value "
+            "loss alone. Useful to fit the value function against a fixed policy before enabling joint training."
+        },
     )
     epsilon: float = field(
         default=0.2,

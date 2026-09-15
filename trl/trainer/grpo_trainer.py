@@ -353,6 +353,7 @@ class GRPOTrainer(_BaseTrainer):
                     "You passed `quantization_config` to the trainer, but your model is already instantiated. The "
                     "`quantization_config` will be ignored."
                 )
+        model.value_head = nn.Sequential(nn.Linear(model.config.hidden_size, 1, dtype=model.dtype), nn.Tanh())
         # Non-quantized models do not have the `is_loaded_in_{8,4}bit` attributes, whereas quantized models do
         _is_quantized_model = getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False)
 
@@ -932,6 +933,11 @@ class GRPOTrainer(_BaseTrainer):
                     f"'token_mask'. Got: {self.vllm_importance_sampling_mode}."
                 )
 
+        self.only_train_value_function = args.only_train_value_function
+        if self.only_train_value_function:
+            for name, param in model.named_parameters():
+                param.requires_grad = name.startswith("value_head.")
+
         # Multi-step
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
         self.epsilon_low = args.epsilon
@@ -1121,6 +1127,17 @@ class GRPOTrainer(_BaseTrainer):
                 logprobs=0,  # we only need the generated token logprobs for the importance sampling correction
                 generation_kwargs=args.generation_kwargs,
             )
+
+            # The vLLM model has no value head, so exclude it from the weight sync
+            _iter_named_params = self.vllm_generation._iter_named_params
+
+            def _iter_named_params_without_value_head():
+                for name, param in _iter_named_params():
+                    if not name.startswith("value_head."):
+                        yield name, param
+
+            self.vllm_generation._iter_named_params = _iter_named_params_without_value_head
+
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
         else:
             generation_kwargs = {
@@ -1458,6 +1475,7 @@ class GRPOTrainer(_BaseTrainer):
         batch_size=None,
         compute_entropy=False,
         compute_aux_loss=False,
+        compute_values=False,
         pixel_values=None,
         image_grid_thw=None,
         num_images=None,
@@ -1468,9 +1486,19 @@ class GRPOTrainer(_BaseTrainer):
         token_type_ids=None,
         mm_token_type_ids=None,
         image_position_ids=None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        """Compute log-probs, (optionally) entropies, and (optionally) the MoE load-balancing aux loss."""
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]
+    ):
+        """Compute log-probs, (optionally) entropies, and the MoE load-balancing aux loss.
+
+        Values from the value head are appended as a fourth element only when `compute_values=True`, so existing
+        callers keep unpacking three.
+        """
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
+        # `model` may be DDP-wrapped, which does not forward attribute access to the wrapped module
+        value_head = self.accelerator.unwrap_model(model).value_head if compute_values else None
+        all_values = []
         all_logps = []
         all_entropies = []
         all_aux_losses = []
@@ -1532,12 +1560,22 @@ class GRPOTrainer(_BaseTrainer):
             if compute_aux_loss:
                 model_inputs["output_router_logits"] = True
 
+            if compute_values:
+                model_inputs["output_hidden_states"] = True
+
             outputs = model(**model_inputs)
             logits = outputs.logits
             # Exclude the last value: it corresponds to the next token pred
             logits = logits[:, :-1, :]  # (B, L-1, H)
             # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
             logits = logits[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
+
+            if compute_values:
+                # values[:, :-1] aligns with logps; values[:, -1] is the bootstrap value of the state
+                # reached after the last completion token.
+                hidden = outputs.hidden_states[-1][:, -(logits_to_keep + 1) :, :]
+                all_values.append(value_head(hidden).squeeze(-1))  # (B, logits_to_keep + 1)
+
             # Divide logits by sampling temperature.
             # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
             logits = logits / self.temperature
@@ -1562,6 +1600,8 @@ class GRPOTrainer(_BaseTrainer):
         logps = torch.cat(all_logps, dim=0)
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
         aux_loss = torch.stack(all_aux_losses).mean() if compute_aux_loss else None
+        if compute_values:
+            return logps, entropies, aux_loss, torch.cat(all_values, dim=0)
         return logps, entropies, aux_loss
 
     def training_step(self, model, inputs, num_items_in_batch):
@@ -2808,7 +2848,8 @@ class GRPOTrainer(_BaseTrainer):
                     f"Invalid value for scale_rewards: {self.scale_rewards}. Must be one of 'batch', 'group', or 'none'."
                 )
 
-            advantages = rewards - mean_grouped_rewards
+            unnormalized_advantages = rewards - mean_grouped_rewards
+            advantages = unnormalized_advantages
             if self.scale_rewards != "none":
                 advantages = advantages / (std_rewards + 1e-4)
             is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))  # for logging
@@ -2822,7 +2863,8 @@ class GRPOTrainer(_BaseTrainer):
             rewards = (reward_k * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
             rewards[unscorable_mask] = torch.nan
             std_rewards = nanstd(rewards).expand_as(rewards) if rewards.numel() > 1 else torch.zeros_like(rewards)
-            advantages = (rewards - torch.nanmean(rewards)) / (std_rewards + 1e-4)
+            unnormalized_advantages = rewards - torch.nanmean(rewards)
+            advantages = unnormalized_advantages / (std_rewards + 1e-4)
             is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))  # for logging
 
         else:
@@ -2834,6 +2876,7 @@ class GRPOTrainer(_BaseTrainer):
         # Unscorable completions (every reward func returned None) carry no learning signal: their reward is NaN here,
         # so zero their advantage to keep them from moving the policy.
         advantages = torch.nan_to_num(advantages, nan=0.0)
+        unnormalized_advantages = torch.nan_to_num(unnormalized_advantages, nan=0.0)
 
         # Slice to keep only the local part of the data
         process_slice = slice(
@@ -2842,6 +2885,7 @@ class GRPOTrainer(_BaseTrainer):
         )
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
+        unnormalized_advantages = unnormalized_advantages[process_slice]
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
@@ -2927,6 +2971,7 @@ class GRPOTrainer(_BaseTrainer):
             "completion_mask": completion_mask,
             "advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
+            "unnormalized_advantages": unnormalized_advantages,
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
@@ -3120,13 +3165,14 @@ class GRPOTrainer(_BaseTrainer):
         mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
 
         # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies, aux_loss = self._get_per_token_logps_and_entropies(
+        per_token_logps, entropies, aux_loss, values = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
             attention_mask,
             logits_to_keep,
             compute_entropy=True,
             compute_aux_loss=self.aux_loss_enabled,
+            compute_values=True,
             pixel_values=inputs.get("pixel_values"),
             image_grid_thw=inputs.get("image_grid_thw"),
             num_images=inputs.get("num_images"),
@@ -3138,6 +3184,19 @@ class GRPOTrainer(_BaseTrainer):
             mm_token_type_ids=inputs.get("mm_token_type_ids"),
             image_position_ids=inputs.get("image_position_ids"),
         )
+
+        value_target = inputs["unnormalized_advantages"].unsqueeze(-1)  # (B, 1), broadcast over tokens
+        value_loss = ((values[:, :-1] - value_target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
+
+        if self.only_train_value_function:
+            mode = "train" if self.model.training else "eval"
+            # Same quantity with the value head predicting 0 everywhere
+            baseline_value_loss = (value_target**2 * mask).sum() / mask.sum().clamp(min=1.0)
+            self._metrics[mode]["value_loss"].append(self.accelerator.gather(value_loss.detach()).mean().item())
+            self._metrics[mode]["baseline_value_loss"].append(
+                self.accelerator.gather(baseline_value_loss.detach()).mean().item()
+            )
+            return value_loss / (self.current_gradient_accumulation_steps if mode == "train" else 1.0)
 
         if self.top_entropy_quantile < 1.0:
             entropy_mask = self.get_high_entropy_mask(entropies, mask, 1 - self.top_entropy_quantile)

@@ -25,6 +25,18 @@ if is_math_verify_available():
     from math_verify import LatexExtractionConfig, parse, verify
 
 
+def _safe_str(parsed) -> str:
+    """Stringify a parsed expression for logging, tolerating values SymPy can't print.
+
+    Printing raises on huge integers (CPython's int -> str digit limit), which a model can produce with something
+    like `9^{9^9}`. Only the logged string is affected: the reward is computed before this.
+    """
+    try:
+        return str(parsed)
+    except Exception:  # noqa: BLE001
+        return "[unprintable]"
+
+
 def accuracy_reward(
     completions: list[list[dict[str, str]]],
     solution: list[str],
@@ -98,8 +110,8 @@ def accuracy_reward(
                 parsing_timeout=parsing_timeout,
             )
             reward = float(verify(gold_parsed, answer_parsed, timeout_seconds=verify_timeout))
-            gold_parsed_strs.append(str(gold_parsed))
-            answer_parsed_strs.append(str(answer_parsed) if answer_parsed else "[unparseable]")
+            gold_parsed_strs.append(_safe_str(gold_parsed))
+            answer_parsed_strs.append(_safe_str(answer_parsed) if answer_parsed else "[unparseable]")
         else:
             # If the gold solution cannot be parsed, we assign `None` to skip this example
             reward = None
@@ -333,8 +345,8 @@ def reasoning_accuracy_reward(
                 parsing_timeout=parsing_timeout,
             )
             reward = float(verify(gold_parsed, answer_parsed, timeout_seconds=verify_timeout))
-            gold_parsed_strs.append(str(gold_parsed))
-            answer_parsed_strs.append(str(answer_parsed) if answer_parsed else "[unparseable]")
+            gold_parsed_strs.append(_safe_str(gold_parsed))
+            answer_parsed_strs.append(_safe_str(answer_parsed) if answer_parsed else "[unparseable]")
         else:
             # If the gold solution cannot be parsed, we assign `None` to skip this example
             reward = None
