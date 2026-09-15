@@ -355,15 +355,26 @@ class GRPOTrainer(_BaseTrainer):
                 )
         # Critic: its own copy of the backbone (no weight sharing with the policy) plus a scalar head. Attached to
         # `model` so the Trainer handles its optimizer params, device placement, DDP wrapping and checkpointing.
+        # The head optionally takes the leave-one-out group mean reward alongside the hidden state, so it can
+        # predict the deviation from the prompt's difficulty instead of having to infer that difficulty itself.
+        head_width = model.config.hidden_size // 4
+        head_in = model.config.hidden_size + (1 if args.condition_critic_on_baseline else 0)
         model.critic = nn.ModuleDict(
             {
                 "backbone": copy.deepcopy(model.base_model),
-                "head": nn.Sequential(nn.Linear(model.config.hidden_size, 1, dtype=model.dtype), nn.Tanh()),
+                "head": nn.Sequential(
+                    nn.Linear(head_in, head_width, dtype=model.dtype),
+                    nn.GELU(),
+                    nn.Linear(head_width, head_width, dtype=model.dtype),
+                    nn.GELU(),
+                    nn.Linear(head_width, 1, dtype=model.dtype),
+                    nn.Tanh(),
+                ),
             }
         )
         if args.zero_init_value_head:
-            nn.init.zeros_(model.critic["head"][0].weight)
-            nn.init.zeros_(model.critic["head"][0].bias)
+            nn.init.zeros_(model.critic["head"][-2].weight)
+            nn.init.zeros_(model.critic["head"][-2].bias)
         # Non-quantized models do not have the `is_loaded_in_{8,4}bit` attributes, whereas quantized models do
         _is_quantized_model = getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False)
 
@@ -944,6 +955,7 @@ class GRPOTrainer(_BaseTrainer):
                 )
 
         self.gae_lambda = args.gae_lambda
+        self.condition_critic_on_baseline = args.condition_critic_on_baseline
 
         # Multi-step
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
@@ -1589,7 +1601,7 @@ class GRPOTrainer(_BaseTrainer):
         aux_loss = torch.stack(all_aux_losses).mean() if compute_aux_loss else None
         return logps, entropies, aux_loss
 
-    def _get_values(self, model, input_ids, attention_mask, logits_to_keep):
+    def _get_values(self, model, input_ids, attention_mask, logits_to_keep, loo_baseline=None):
         """Per-token values from the critic, which has its own backbone and shares no weights with the policy.
 
         `values[:, :-1]` aligns with the completion tokens; `values[:, -1]` is the bootstrap value of the state
@@ -1598,7 +1610,12 @@ class GRPOTrainer(_BaseTrainer):
         # `model` may be DDP-wrapped, which does not forward attribute access to the wrapped module
         critic = self.accelerator.unwrap_model(model).critic
         hidden = critic["backbone"](input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        return critic["head"](hidden[:, -(logits_to_keep + 1) :, :]).squeeze(-1)  # (B, logits_to_keep + 1)
+        hidden = hidden[:, -(logits_to_keep + 1) :, :]
+        if self.condition_critic_on_baseline:
+            # Centered to [-1, 1], assuming a reward in [0, 1]
+            baseline = (2 * loo_baseline - 1).view(-1, 1, 1).expand(-1, hidden.size(1), 1).to(hidden.dtype)
+            hidden = torch.cat([hidden, baseline], dim=-1)
+        return critic["head"](hidden).squeeze(-1)  # (B, logits_to_keep + 1)
 
     def _critic_params(self, model):
         critic_ids = {id(p) for p in self.accelerator.unwrap_model(model).critic.parameters()}
@@ -3283,7 +3300,7 @@ class GRPOTrainer(_BaseTrainer):
             image_position_ids=inputs.get("image_position_ids"),
         )
 
-        values = self._get_values(model, input_ids, attention_mask, logits_to_keep)
+        values = self._get_values(model, input_ids, attention_mask, logits_to_keep, inputs["loo_baseline"])
         value_target = inputs["unnormalized_advantages"].unsqueeze(-1)  # (B, 1), broadcast over tokens
         regression_target = value_target if self.gae_lambda is None else self._gae_returns(values, value_target, mask)
         value_loss = ((values[:, :-1] - regression_target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)

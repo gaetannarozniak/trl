@@ -179,9 +179,12 @@ class GRPOConfig(_BaseConfig):
         critic_max_grad_norm (`float`, *optional*):
             Max gradient norm for the critic. The critic is always clipped separately from the policy, so that
             neither rescales the other's gradients. If `None` (default), `max_grad_norm` is used as the threshold.
-        zero_init_value_head (`bool`, *optional*, defaults to `False`):
+        zero_init_value_head (`bool`, *optional*, defaults to `True`):
             Whether to zero-initialize the critic's linear value head, so that it predicts exactly 0 everywhere at
             the start of training instead of arbitrary values.
+        condition_critic_on_baseline (`bool`, *optional*, defaults to `True`):
+            Whether to feed the leave-one-out group mean reward to the critic's head alongside the hidden state, so
+            it predicts the deviation from the prompt's difficulty rather than inferring that difficulty itself.
         gae_lambda (`float`, *optional*):
             If set, the critic regresses on TD(lambda) returns instead of the final reward. `gamma` is 1 and the
             only reward is terminal, so `1.0` recovers the Monte-Carlo target and `0.0` gives one-step TD.
@@ -711,10 +714,17 @@ class GRPOConfig(_BaseConfig):
         },
     )
     zero_init_value_head: bool = field(
-        default=False,
+        default=True,
         metadata={
             "help": "Whether to zero-initialize the critic's linear value head, so that it predicts exactly 0 "
             "everywhere at the start of training instead of arbitrary values."
+        },
+    )
+    condition_critic_on_baseline: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to feed the leave-one-out group mean reward to the critic's head alongside the hidden "
+            "state, so it predicts the deviation from the prompt's difficulty rather than inferring it."
         },
     )
     gae_lambda: float | None = field(
