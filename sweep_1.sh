@@ -14,6 +14,11 @@ cd "$(dirname "$0")"
 DRY_RUN=""
 [ "${1:-}" = "--dry-run" ] && DRY_RUN="echo"
 
+# my_grpo.sbatch renames the job to its --run_name, so what is already queued or running is exactly the set of
+# names to leave alone. Re-running this script therefore submits only what is missing, which is how a job that
+# died gets relaunched: no separate script, and no risk of a duplicate.
+QUEUED="$(squeue -u "$USER" -h -o '%j' 2>/dev/null || true)"
+
 CRITIC_LR=1e-5
 POLICY_LRS=(1e-6 0)
 SEEDS=(0 1 2)
@@ -38,6 +43,10 @@ for seed in "${SEEDS[@]}"; do
             suffix="${config%%;*}"
             extra="${config#*;}"
             name="${PREFIX}_plr${policy_lr}|vlr${CRITIC_LR}|${suffix}|s${seed}"
+            if grep -qxF -- "$name" <<<"$QUEUED"; then
+                echo "already queued, skipping: $name"
+                continue
+            fi
             $DRY_RUN sbatch my_grpo.sbatch \
                 --run_name "$name" \
                 --output_dir "trainer_output/${name//|/_}" \

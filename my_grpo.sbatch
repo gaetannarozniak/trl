@@ -27,6 +27,11 @@ done
 cd /storage/home/gaetan/projects/trl
 source .venv/bin/activate
 
+# Every rank resolves the same model and dataset at startup. Submitting a sweep at once puts dozens of them on
+# the Hub API within seconds, which answers HTTP 429 and takes the job down before training starts. Both are in
+# the local cache already, so resolve from there and never reach for the network.
+export HF_HUB_OFFLINE=1
+
 echo "job $SLURM_JOB_ID (${NAME:-unnamed}) on $(hostname) | gpus=$SLURM_GPUS_ON_NODE cpus=$SLURM_CPUS_ON_NODE"
 
 accelerate launch --num_processes 4 trl/scripts/my_grpo.py "$@"
