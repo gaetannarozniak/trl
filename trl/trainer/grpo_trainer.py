@@ -958,6 +958,7 @@ class GRPOTrainer(_BaseTrainer):
         self.condition_critic_on_baseline = args.condition_critic_on_baseline
         self.use_value_advantages = args.use_value_advantages
         self.value_advantages_warmup_steps = args.value_advantages_warmup_steps
+        self.value_advantages_preserve_sum = args.value_advantages_preserve_sum
 
         # Multi-step
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
@@ -1605,12 +1606,16 @@ class GRPOTrainer(_BaseTrainer):
         return logps, entropies, aux_loss
 
     @torch.no_grad()
-    def _maybe_log_advantage_plot(self, values, advantages, mask, inputs, every=10):
-        """Every `every` steps, log to wandb one figure per prompt of the batch, showing the cumulative
-        advantages of its generations.
+    def _maybe_log_advantage_plot(self, value_advantages, advantages, mask, inputs, every=25):
+        """Every `every` steps, log an HTML chart of the cumulative advantage along one prompt's generations.
 
-        Left panel is the uniform GRPO advantage, right panel the critic-derived one; green is a successful
-        rollout, red a failed one. Both panels end at the same value, since the per-rollout sum is preserved.
+        The prompt is picked among those holding both a correct and an incorrect rollout, since the point of the
+        plot is to compare how credit is spread in either case. Solid is the critic-derived advantage, dashed the
+        uniform GRPO one; the two curves of a rollout end at the same value under `value_advantages_preserve_sum`,
+        and the gap between the endpoints is the critic's error on the rollout otherwise. Blue is a correct
+        rollout, vermillion an incorrect one (Okabe-Ito, separable under colour-vision deficiency).
+
+        Emitted as inline SVG rather than through a plotting library, so it needs no dependency beyond wandb.
         """
         step = self.state.global_step
         if step % every != 0 or step == self._last_advantage_plot_step:
@@ -1619,83 +1624,116 @@ class GRPOTrainer(_BaseTrainer):
             return
         self._last_advantage_plot_step = step
 
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        value_advantages = self._value_advantages(values, advantages, mask)
         # rewards are recoverable: loo_baseline was built as reward - unnormalized_advantages
         rewards = inputs["loo_baseline"] + inputs["unnormalized_advantages"]
-        images = []
-        charts = {}
+        correct = rewards > 0
         groups = inputs["prompt_group"]
-        for gid in groups.unique().tolist():
-            rows = (groups == gid).nonzero(as_tuple=True)[0].tolist()
-            fig, (ax, ax_raw) = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
-            for row in rows:
-                length = int(mask[row].sum().item())
-                if length == 0:
-                    continue
-                color = "tab:green" if rewards[row].item() > 0 else "tab:red"
-                x = range(length)
-                value = value_advantages[row, :length].float().cpu()
-                # GRPO spreads the same total uniformly, so both curves end at the same point
-                uniform = advantages[row].item() / length
-                grpo = uniform * torch.arange(1, length + 1, dtype=torch.float)
-                ax.plot(x, grpo.numpy(), color=color, alpha=0.5, linestyle="--", linewidth=1.0)
-                ax.plot(x, value.cumsum(0).numpy(), color=color, alpha=0.8)
-                ax_raw.plot(x, value.numpy(), color=color, alpha=0.25, linewidth=0.8, zorder=1)
-                ax_raw.plot(x, [uniform] * length, color=color, alpha=0.9, linestyle="--", linewidth=1.4, zorder=3)
-            for axis, ylabel in ((ax, "cumulative advantage"), (ax_raw, "advantage")):
-                axis.axhline(0.0, color="grey", linewidth=0.8, linestyle=":")
-                axis.set_ylabel(ylabel)
-                axis.plot([], [], color="grey", linestyle="--", label="GRPO (uniform)")
-                axis.plot([], [], color="grey", label="value")
-                axis.legend(loc="best", fontsize=8)
-            ax_raw.set_xlabel("completion token")
-            a = advantages[rows]
-            fig.suptitle(
-                f"step {step} - prompt {gid} ({len(rows)} gens, mean R={rewards[rows].mean().item():.2f}, "
-                f"A_grpo in [{a.min().item():.3g}, {a.max().item():.3g}]) - green=success, red=failure",
-                fontsize=9,
-            )
-            fig.tight_layout()
-            images.append(wandb.Image(fig))
-            plt.close(fig)
+        gids = groups.unique().tolist()
+        # A mixed group shows both regimes side by side; fall back to the first one when the batch has none
+        mixed = [g for g in gids if 0 < correct[groups == g].sum().item() < (groups == g).sum().item()]
+        gid = mixed[0] if mixed else gids[0]
+        rows = (groups == gid).nonzero(as_tuple=True)[0].tolist()
 
-            # Native chart as well, so the curves are also browsable (and zoomable) from the Charts section.
-            # Downsampled, since a custom chart carries every point as a table row.
-            xs, ys, keys = [], [], []
-            for i, row in enumerate(rows):
-                length = int(mask[row].sum().item())
-                if length == 0:
-                    continue
-                stride = max(1, length // 256)
-                x = list(range(0, length, stride))
-                tag = f"gen{i}{'+' if rewards[row].item() > 0 else '-'}"
-                grpo = (advantages[row].item() * torch.arange(1, length + 1, dtype=torch.float) / length)[::stride]
-                value = value_advantages[row, :length].float().cpu().cumsum(0)[::stride]
-                xs += [x, x]
-                ys += [grpo.tolist(), value.tolist()]
-                keys += [f"{tag} grpo", f"{tag} value"]
-            if ys:
-                charts[f"advantages/prompt_{gid}"] = wandb.plot.line_series(
-                    xs=xs, ys=ys, keys=keys, title=f"cumulative advantage - prompt {gid}", xname="token"
+        curves = []
+        for row in rows:
+            length = int(mask[row].sum().item())
+            if length == 0:
+                continue
+            stride = max(1, length // 400)  # keeps the payload small on long completions
+            xs = list(range(0, length, stride))
+            value = value_advantages[row, :length].float().cpu().cumsum(0)[::stride].tolist()
+            # GRPO's total spread evenly, so the dashed curve is the straight line to the same endpoint
+            grpo = [advantages[row].item() * (x + 1) / length for x in xs]
+            curves.append((xs, value, grpo, bool(correct[row])))
+        if not curves:
+            return
+
+        width, height, left, right, top, bottom = 860, 460, 64, 18, 32, 44
+        xmax = max(xs[-1] for xs, *_ in curves) or 1
+        flat = [v for _, value, grpo, _ in curves for v in value + grpo] + [0.0]
+        lo, hi = min(flat), max(flat)
+        pad = (hi - lo) * 0.06 or 0.1
+        lo, hi = lo - pad, hi + pad
+
+        def fx(x):
+            return left + (width - left - right) * x / xmax
+
+        def fy(y):
+            return top + (height - top - bottom) * (hi - y) / (hi - lo)
+
+        svg = [f'<svg viewBox="0 0 {width} {height}" width="100%" xmlns="http://www.w3.org/2000/svg">']
+        for i in range(5):
+            y = lo + (hi - lo) * i / 4
+            svg.append(f'<line x1="{left}" y1="{fy(y):.1f}" x2="{width - right}" y2="{fy(y):.1f}" stroke="#e5e7eb"/>')
+            svg.append(f'<text x="{left - 8}" y="{fy(y) + 4:.1f}" text-anchor="end" fill="#6b7280">{y:.3g}</text>')
+            x = xmax * i / 4
+            svg.append(
+                f'<text x="{fx(x):.1f}" y="{height - bottom + 18}" text-anchor="middle" '
+                f'fill="#6b7280">{x:.0f}</text>'
+            )
+        svg.append(
+            f'<line x1="{left}" y1="{fy(0):.1f}" x2="{width - right}" y2="{fy(0):.1f}" stroke="#9ca3af" '
+            f'stroke-dasharray="2 3"/>'
+        )
+        for xs, value, grpo, ok in curves:
+            color = "#0072B2" if ok else "#D55E00"
+            label = "correct" if ok else "incorrect"
+            for points, dash, opacity, name in (
+                (grpo, ' stroke-dasharray="4 4"', 0.3, "GRPO uniform"),
+                (value, "", 0.55, "critic"),
+            ):
+                path = " ".join(f"{fx(x):.1f},{fy(y):.1f}" for x, y in zip(xs, points))
+                svg.append(
+                    f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="2"{dash} '
+                    f'opacity="{opacity}"><title>{label} - {name}</title></polyline>'
                 )
-        wandb.log({"advantages/per_token": images, **charts}, step=step)
+        mid = (top + height - bottom) / 2
+        svg.append(
+            f'<text x="{left}" y="18" font-size="13" fill="#111827">step {step} - prompt {gid} - {len(curves)} '
+            f'generations - mean reward {rewards[rows].mean().item():.2f}</text>'
+        )
+        svg.append(
+            f'<text x="{(left + width - right) / 2:.0f}" y="{height - 8}" text-anchor="middle" fill="#6b7280">'
+            f"completion token</text>"
+        )
+        svg.append(
+            f'<text x="16" y="{mid:.0f}" transform="rotate(-90 16 {mid:.0f})" text-anchor="middle" fill="#6b7280">'
+            f"cumulative advantage</text>"
+        )
+        svg.append("</svg>")
+
+        legend = "".join(
+            f'<span style="margin-right:20px"><svg width="26" height="10" style="vertical-align:middle">'
+            f'<line x1="1" y1="5" x2="25" y2="5" stroke="{color}" stroke-width="2"{dash}/></svg> {text}</span>'
+            for color, dash, text in (
+                ("#0072B2", "", "correct rollout"),
+                ("#D55E00", "", "incorrect rollout"),
+                ("#6b7280", "", "critic advantage"),
+                ("#6b7280", ' stroke-dasharray="4 4"', "GRPO uniform"),
+            )
+        )
+        html = (
+            '<!DOCTYPE html><meta charset="utf-8">'
+            '<div style="background:#fff;padding:8px;color:#111827;font:11px ui-sans-serif,system-ui,sans-serif">'
+            f'{"".join(svg)}<div style="padding-top:6px;color:#374151">{legend}</div></div>'
+        )
+        wandb.log({"advantages/cumsum": wandb.Html(html, inject=False)}, step=step)
 
     @torch.no_grad()
     def _value_advantages(self, values, advantages, mask):
         """Per-token advantage from the critic instead of GRPO's uniform one.
 
-        With gamma=1 the advantage is `V(s_t+1) - V(s_t)`, plus the one constant per rollout that makes the sum
-        match GRPO's: `shift = (A_grpo - sum_t delta_t) / T`, so `sum_t A_t = A_grpo`, `scale_rewards` included.
-        A critic that is flat along the trajectory therefore spreads `A_grpo` uniformly, as GRPO does.
+        With gamma=1 the advantage is the TD residual `V(s_t+1) - V(s_t)`. Under `value_advantages_preserve_sum`
+        one constant per rollout is added on top, `shift = (A_grpo - sum_t delta_t) / T`, so that
+        `sum_t A_t = A_grpo`, `scale_rewards` included; a critic that is flat along the trajectory then spreads
+        `A_grpo` uniformly, as GRPO does. Without it the residuals are used raw, and their sum is the critic's own
+        estimate `V(s_T) - V(s_0)`, so the group baseline only reaches the policy through the critic's target.
         """
         values = values.detach()
-        lengths = mask.sum(dim=1, keepdim=True).clamp(min=1)
         deltas = (values[:, 1:] - values[:, :-1]) * mask
+        if not self.value_advantages_preserve_sum:
+            return deltas
+        lengths = mask.sum(dim=1, keepdim=True).clamp(min=1)
         shift = (advantages.unsqueeze(-1) - deltas.sum(dim=1, keepdim=True)) / lengths
         return (deltas + shift) * mask
 
@@ -3413,10 +3451,13 @@ class GRPOTrainer(_BaseTrainer):
 
         # Compute the loss
         advantages = inputs["advantages"]
-        self._maybe_log_advantage_plot(values, advantages, mask, inputs)
+        # Always computed, so the plot and the spread metric report what the critic would do even when its
+        # advantages are not the ones being optimized
+        value_advantages = self._value_advantages(values, advantages, mask)
+        self._maybe_log_advantage_plot(value_advantages, advantages, mask, inputs)
         warmup = self.value_advantages_warmup_steps
         if self.use_value_advantages and (warmup is None or self.state.global_step >= warmup):
-            advantages = self._value_advantages(values, advantages, mask)
+            advantages = value_advantages
         # In the base GRPO implementation, advantages are expected to have shape (B,). To support subclasses that
         # provide advantages with shape (B, T) (e.g., MiniLLM), we *conditionally* unsqueeze the tensor.
         if advantages.dim() == 1:
@@ -3626,6 +3667,13 @@ class GRPOTrainer(_BaseTrainer):
         )
 
         self._log_value_r2(values, value_target, mask, mode)
+
+        # How unevenly the critic spreads credit inside a trajectory, averaged over the batch. Exactly 0 when the
+        # critic is flat, since the per-token advantage is then GRPO's uniform one.
+        lengths = mask.sum(dim=1).clamp(min=1)
+        deviation = (value_advantages - (value_advantages.sum(dim=1) / lengths).unsqueeze(1)) * mask
+        advantage_std = ((deviation**2).sum(dim=1) / lengths).sqrt()
+        self._metrics[mode]["advantage_std"].append(self.accelerator.gather(advantage_std).mean().item())
 
         # Log the metrics
         def masked_seq_mean(x):

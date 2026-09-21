@@ -191,6 +191,11 @@ class GRPOConfig(_BaseConfig):
         value_advantages_warmup_steps (`int`, *optional*):
             Number of steps to keep using the plain GRPO advantage before `use_value_advantages` takes effect,
             giving the critic time to become useful. If `None` (default), it applies from the first step.
+        value_advantages_preserve_sum (`bool`, *optional*, defaults to `True`):
+            Whether to add the per-rollout constant that makes the per-token advantages sum to GRPO's advantage.
+            When `False`, the advantage is the raw `V(s_t+1) - V(s_t)`, whose sum is the critic's own estimate
+            `V(s_T) - V(s_0)`, so the group baseline only reaches the policy through the critic's target and a
+            flat critic yields no learning signal at all.
         gae_lambda (`float`, *optional*):
             If set, the critic regresses on TD(lambda) returns instead of the final reward. `gamma` is 1 and the
             only reward is terminal, so `1.0` recovers the Monte-Carlo target and `0.0` gives one-step TD.
@@ -745,6 +750,15 @@ class GRPOConfig(_BaseConfig):
         metadata={
             "help": "Number of steps to keep using the plain GRPO advantage before `use_value_advantages` takes "
             "effect, giving the critic time to become useful. If `None` (default), it applies from the first step."
+        },
+    )
+    value_advantages_preserve_sum: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to add the per-rollout constant that makes the per-token advantages sum to GRPO's "
+            "advantage. When `False`, the advantage is the raw `V(s_t+1) - V(s_t)`, whose sum is the critic's own "
+            "estimate `V(s_T) - V(s_0)`, so the group baseline only reaches the policy through the critic's target "
+            "and a flat critic yields no learning signal at all."
         },
     )
     gae_lambda: float | None = field(
