@@ -7,7 +7,8 @@
 # One script per plot: plot_<name>.py writes plots/<name>.png, and is picked up here with no further wiring.
 
 PYTHON ?= ../.venv/bin/python
-ICAT ?= $(shell command -v kitten >/dev/null 2>&1 && echo "kitten icat" || echo imgcat)
+# icat.py, not imgcat: imgcat speaks the iTerm2 protocol, which kitty renders as a wall of escape codes.
+ICAT ?= $(shell command -v kitten >/dev/null 2>&1 && echo "kitten icat" || echo "$(PYTHON) icat.py")
 
 SCRIPTS := $(wildcard plot_*.py)
 IMAGES := $(patsubst plot_%.py,plots/%.png,$(SCRIPTS))
