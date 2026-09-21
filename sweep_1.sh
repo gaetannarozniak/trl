@@ -30,11 +30,13 @@ CONFIGS=(
     "gaenone|v_adv|targetR;--use_value_advantages True --center_value_target False"
 )
 
-for policy_lr in "${POLICY_LRS[@]}"; do
-    for config in "${CONFIGS[@]}"; do
-        suffix="${config%%;*}"
-        extra="${config#*;}"
-        for seed in "${SEEDS[@]}"; do
+# Seed outermost, so the first pass submits one seed of every configuration: a queue that only drains part of
+# the sweep still covers the whole grid rather than all the seeds of the first few arms.
+for seed in "${SEEDS[@]}"; do
+    for policy_lr in "${POLICY_LRS[@]}"; do
+        for config in "${CONFIGS[@]}"; do
+            suffix="${config%%;*}"
+            extra="${config#*;}"
             name="${PREFIX}_plr${policy_lr}|vlr${CRITIC_LR}|${suffix}|s${seed}"
             $DRY_RUN sbatch my_grpo.sbatch \
                 --run_name "$name" \
