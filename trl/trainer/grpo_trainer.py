@@ -959,6 +959,7 @@ class GRPOTrainer(_BaseTrainer):
         self.use_value_advantages = args.use_value_advantages
         self.value_advantages_warmup_steps = args.value_advantages_warmup_steps
         self.value_advantages_preserve_sum = args.value_advantages_preserve_sum
+        self.center_value_target = args.center_value_target
 
         # Multi-step
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
@@ -1821,15 +1822,18 @@ class GRPOTrainer(_BaseTrainer):
         return advantages + values[:, :-1]
 
     @torch.no_grad()
-    def _log_value_r2(self, values, value_target, mask, mode):
+    def _log_value_r2(self, values, value_target, centered_target, mask, mode):
         """Log the critic's explained variance, overall and in 4 buckets of relative position.
 
-        Unanimous groups are excluded: their target is zero everywhere, so they carry no signal and would only drag
-        the ratio towards 0.
+        Unanimous groups are excluded: their leave-one-out advantage is zero everywhere, so they carry no signal
+        and would only drag the ratio towards 0. That test is always made on `centered_target`, since under
+        `center_value_target=False` a zero `value_target` instead marks an incorrect rollout, which does carry
+        signal. Note the ratio is taken against `sum(target^2)` rather than the target's variance, so it is only
+        an explained variance where the target is centred; across the two settings it is not comparable.
         """
         squared_error = (values[:, :-1] - value_target) ** 2
         signal = value_target**2
-        keep = mask * (value_target.abs() > 1e-8).to(mask.dtype)
+        keep = mask * (centered_target.abs() > 1e-8).to(mask.dtype)
         positions = torch.arange(mask.size(1), device=mask.device).expand_as(mask)
         bucket = (positions * 4 // mask.sum(dim=1, keepdim=True).clamp(min=1)).clamp(max=3)
         for suffix, selected in [("", keep)] + [(f"_q{b + 1}", keep * (bucket == b)) for b in range(4)]:
@@ -3440,7 +3444,12 @@ class GRPOTrainer(_BaseTrainer):
         )
 
         values = self._get_values(model, input_ids, attention_mask, logits_to_keep, inputs["loo_baseline"])
-        value_target = inputs["unnormalized_advantages"].unsqueeze(-1)  # (B, 1), broadcast over tokens
+        # The critic regresses on the leave-one-out advantage `R - R_bar`, or on the raw reward `R` itself. The two
+        # differ by a constant per rollout, which cancels in `_value_advantages` as it only reads differences of V.
+        centered_target = inputs["unnormalized_advantages"].unsqueeze(-1)  # (B, 1), broadcast over tokens
+        value_target = centered_target
+        if not self.center_value_target:
+            value_target = value_target + inputs["loo_baseline"].unsqueeze(-1)
         regression_target = value_target if self.gae_lambda is None else self._gae_returns(values, value_target, mask)
         value_loss = ((values[:, :-1] - regression_target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
 
@@ -3666,7 +3675,7 @@ class GRPOTrainer(_BaseTrainer):
             self.accelerator.gather(baseline_value_loss.detach()).mean().item()
         )
 
-        self._log_value_r2(values, value_target, mask, mode)
+        self._log_value_r2(values, value_target, centered_target, mask, mode)
 
         # How unevenly the critic spreads credit inside a trajectory, averaged over the batch. Exactly 0 when the
         # critic is flat, since the per-token advantage is then GRPO's uniform one.

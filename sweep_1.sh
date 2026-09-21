@@ -1,7 +1,7 @@
 #!/bin/bash
 # First large experiment: does a critic-derived per-token advantage beat GRPO's uniform one?
 #
-# 4 configurations x 5 seeds = 20 jobs, 4 GPUs each. The critic is trained in all of them (it is built
+# 5 configurations x 5 seeds = 25 jobs, 4 GPUs each. The critic is trained in all of them (it is built
 # unconditionally), so the baseline still reports `value_r2` and `advantage_std` and stays comparable.
 #
 #   ./sweep_1.sh           submit
@@ -24,6 +24,8 @@ CONFIGS=(
     "gae0.99|v_adv;--use_value_advantages True --gae_lambda 0.99"
     # Raw TD residuals: no per-rollout constant, so the sum is the critic's own V(s_T) - V(s_0)
     "gaenone|v_adv|nosum;--use_value_advantages True --value_advantages_preserve_sum False"
+    # Critic regressed on the raw reward R instead of the leave-one-out advantage R - R_bar
+    "gaenone|v_adv|targetR;--use_value_advantages True --center_value_target False"
 )
 
 for config in "${CONFIGS[@]}"; do
