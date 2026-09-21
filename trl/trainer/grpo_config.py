@@ -185,6 +185,12 @@ class GRPOConfig(_BaseConfig):
         condition_critic_on_baseline (`bool`, *optional*, defaults to `True`):
             Whether to feed the leave-one-out group mean reward to the critic's head alongside the hidden state, so
             it predicts the deviation from the prompt's difficulty rather than inferring that difficulty itself.
+        use_value_advantages (`bool`, *optional*, defaults to `False`):
+            Whether to replace the uniform GRPO advantage with a per-token one derived from the critic,
+            `V(s_t+1) - V(s_t)` with `gamma=1`. The per-rollout sum of advantages is preserved exactly.
+        value_advantages_warmup_steps (`int`, *optional*):
+            Number of steps to keep using the plain GRPO advantage before `use_value_advantages` takes effect,
+            giving the critic time to become useful. If `None` (default), it applies from the first step.
         gae_lambda (`float`, *optional*):
             If set, the critic regresses on TD(lambda) returns instead of the final reward. `gamma` is 1 and the
             only reward is terminal, so `1.0` recovers the Monte-Carlo target and `0.0` gives one-step TD.
@@ -725,6 +731,20 @@ class GRPOConfig(_BaseConfig):
         metadata={
             "help": "Whether to feed the leave-one-out group mean reward to the critic's head alongside the hidden "
             "state, so it predicts the deviation from the prompt's difficulty rather than inferring it."
+        },
+    )
+    use_value_advantages: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to replace the uniform GRPO advantage with a per-token one derived from the critic, "
+            "`V(s_t+1) - V(s_t)` with `gamma=1`. The per-rollout sum of advantages is preserved exactly."
+        },
+    )
+    value_advantages_warmup_steps: int | None = field(
+        default=None,
+        metadata={
+            "help": "Number of steps to keep using the plain GRPO advantage before `use_value_advantages` takes "
+            "effect, giving the critic time to become useful. If `None` (default), it applies from the first step."
         },
     )
     gae_lambda: float | None = field(

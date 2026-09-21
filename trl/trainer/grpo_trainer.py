@@ -956,6 +956,8 @@ class GRPOTrainer(_BaseTrainer):
 
         self.gae_lambda = args.gae_lambda
         self.condition_critic_on_baseline = args.condition_critic_on_baseline
+        self.use_value_advantages = args.use_value_advantages
+        self.value_advantages_warmup_steps = args.value_advantages_warmup_steps
 
         # Multi-step
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
@@ -963,6 +965,7 @@ class GRPOTrainer(_BaseTrainer):
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
         # Tracks the number of iterations (forward + backward passes), including those within a grad accum cycle
         self._step = 0
+        self._last_advantage_plot_step = -1
         # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
         # `_get_train_sampler` and `_prepare_inputs`.
         self._buffered_inputs = None
@@ -1600,6 +1603,101 @@ class GRPOTrainer(_BaseTrainer):
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
         aux_loss = torch.stack(all_aux_losses).mean() if compute_aux_loss else None
         return logps, entropies, aux_loss
+
+    @torch.no_grad()
+    def _maybe_log_advantage_plot(self, values, advantages, mask, inputs, every=10):
+        """Every `every` steps, log to wandb one figure per prompt of the batch, showing the cumulative
+        advantages of its generations.
+
+        Left panel is the uniform GRPO advantage, right panel the critic-derived one; green is a successful
+        rollout, red a failed one. Both panels end at the same value, since the per-rollout sum is preserved.
+        """
+        step = self.state.global_step
+        if step % every != 0 or step == self._last_advantage_plot_step:
+            return
+        if not (self.accelerator.is_main_process and wandb.run is not None):
+            return
+        self._last_advantage_plot_step = step
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        value_advantages = self._value_advantages(values, advantages, mask)
+        # rewards are recoverable: loo_baseline was built as reward - unnormalized_advantages
+        rewards = inputs["loo_baseline"] + inputs["unnormalized_advantages"]
+        images = []
+        charts = {}
+        groups = inputs["prompt_group"]
+        for gid in groups.unique().tolist():
+            rows = (groups == gid).nonzero(as_tuple=True)[0].tolist()
+            fig, (ax, ax_raw) = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
+            for row in rows:
+                length = int(mask[row].sum().item())
+                if length == 0:
+                    continue
+                color = "tab:green" if rewards[row].item() > 0 else "tab:red"
+                x = range(length)
+                value = value_advantages[row, :length].float().cpu()
+                # GRPO spreads the same total uniformly, so both curves end at the same point
+                uniform = advantages[row].item() / length
+                grpo = uniform * torch.arange(1, length + 1, dtype=torch.float)
+                ax.plot(x, grpo.numpy(), color=color, alpha=0.5, linestyle="--", linewidth=1.0)
+                ax.plot(x, value.cumsum(0).numpy(), color=color, alpha=0.8)
+                ax_raw.plot(x, value.numpy(), color=color, alpha=0.25, linewidth=0.8, zorder=1)
+                ax_raw.plot(x, [uniform] * length, color=color, alpha=0.9, linestyle="--", linewidth=1.4, zorder=3)
+            for axis, ylabel in ((ax, "cumulative advantage"), (ax_raw, "advantage")):
+                axis.axhline(0.0, color="grey", linewidth=0.8, linestyle=":")
+                axis.set_ylabel(ylabel)
+                axis.plot([], [], color="grey", linestyle="--", label="GRPO (uniform)")
+                axis.plot([], [], color="grey", label="value")
+                axis.legend(loc="best", fontsize=8)
+            ax_raw.set_xlabel("completion token")
+            a = advantages[rows]
+            fig.suptitle(
+                f"step {step} - prompt {gid} ({len(rows)} gens, mean R={rewards[rows].mean().item():.2f}, "
+                f"A_grpo in [{a.min().item():.3g}, {a.max().item():.3g}]) - green=success, red=failure",
+                fontsize=9,
+            )
+            fig.tight_layout()
+            images.append(wandb.Image(fig))
+            plt.close(fig)
+
+            # Native chart as well, so the curves are also browsable (and zoomable) from the Charts section.
+            # Downsampled, since a custom chart carries every point as a table row.
+            xs, ys, keys = [], [], []
+            for i, row in enumerate(rows):
+                length = int(mask[row].sum().item())
+                if length == 0:
+                    continue
+                stride = max(1, length // 256)
+                x = list(range(0, length, stride))
+                tag = f"gen{i}{'+' if rewards[row].item() > 0 else '-'}"
+                grpo = (advantages[row].item() * torch.arange(1, length + 1, dtype=torch.float) / length)[::stride]
+                value = value_advantages[row, :length].float().cpu().cumsum(0)[::stride]
+                xs += [x, x]
+                ys += [grpo.tolist(), value.tolist()]
+                keys += [f"{tag} grpo", f"{tag} value"]
+            if ys:
+                charts[f"advantages/prompt_{gid}"] = wandb.plot.line_series(
+                    xs=xs, ys=ys, keys=keys, title=f"cumulative advantage - prompt {gid}", xname="token"
+                )
+        wandb.log({"advantages/per_token": images, **charts}, step=step)
+
+    @torch.no_grad()
+    def _value_advantages(self, values, advantages, mask):
+        """Per-token advantage from the critic instead of GRPO's uniform one.
+
+        With gamma=1 the advantage is `V(s_t+1) - V(s_t)`, plus the one constant per rollout that makes the sum
+        match GRPO's: `shift = (A_grpo - sum_t delta_t) / T`, so `sum_t A_t = A_grpo`, `scale_rewards` included.
+        A critic that is flat along the trajectory therefore spreads `A_grpo` uniformly, as GRPO does.
+        """
+        values = values.detach()
+        lengths = mask.sum(dim=1, keepdim=True).clamp(min=1)
+        deltas = (values[:, 1:] - values[:, :-1]) * mask
+        shift = (advantages.unsqueeze(-1) - deltas.sum(dim=1, keepdim=True)) / lengths
+        return (deltas + shift) * mask
 
     def _get_values(self, model, input_ids, attention_mask, logits_to_keep, loo_baseline=None):
         """Per-token values from the critic, which has its own backbone and shares no weights with the policy.
@@ -3001,6 +3099,8 @@ class GRPOTrainer(_BaseTrainer):
         advantages = advantages[process_slice]
         unnormalized_advantages = unnormalized_advantages[process_slice]
         loo_baseline = loo_baseline[process_slice]
+        # survives the shuffle in `_prepare_inputs`, so the generations of a prompt stay identifiable
+        prompt_group = (torch.arange(rewards.size(0), device=device) // num_generations)[process_slice]
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
@@ -3088,6 +3188,7 @@ class GRPOTrainer(_BaseTrainer):
             "num_items_in_batch": num_items_in_batch,
             "unnormalized_advantages": unnormalized_advantages,
             "loo_baseline": loo_baseline,
+            "prompt_group": prompt_group,
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
@@ -3312,6 +3413,10 @@ class GRPOTrainer(_BaseTrainer):
 
         # Compute the loss
         advantages = inputs["advantages"]
+        self._maybe_log_advantage_plot(values, advantages, mask, inputs)
+        warmup = self.value_advantages_warmup_steps
+        if self.use_value_advantages and (warmup is None or self.state.global_step >= warmup):
+            advantages = self._value_advantages(values, advantages, mask)
         # In the base GRPO implementation, advantages are expected to have shape (B,). To support subclasses that
         # provide advantages with shape (B, T) (e.g., MiniLLM), we *conditionally* unsqueeze the tensor.
         if advantages.dim() == 1:
