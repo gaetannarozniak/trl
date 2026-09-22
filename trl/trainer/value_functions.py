@@ -3,7 +3,11 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, is_wandb_available
+
+
+if is_wandb_available():
+    import wandb
 
 
 @dataclass(frozen=True)
@@ -12,7 +16,10 @@ class ValueFunctionConfig:
     value_lambda: float | None = None
     adv_lambda: float | None = None
     critic_lr: float = 1e-5
-    target: str = "residual"  # "residual" for R - Rloo, "plain" for R
+    critic_layer: int | None = None  # read the backbone after this block instead of the last one
+    target: str = (
+        "residual"  # "residual" for R - Rloo, "plain" for R, "grpo" for linear interpolation between Rloo and R
+    )
 
 
 # maybe still need to deal with the vllm iter_name_params for the critic, it seems redundant in the way we find the critic params (already two ways)
@@ -20,12 +27,20 @@ class ValueFunctionConfig:
 class ValueFunction:
     def __init__(self, args: ValueFunctionConfig):
         self.args = args
+        self._last_plot_step = -1
 
     def get_critic(self, policy_net: PreTrainedModel) -> nn.ModuleDict:
         head_in = policy_net.config.hidden_size
+        backbone = copy.deepcopy(policy_net.base_model)
+        if self.args.critic_layer is not None:
+            if not 1 <= self.args.critic_layer <= len(backbone.layers):
+                raise ValueError(f"critic_layer must be in [1, {len(backbone.layers)}], got {self.args.critic_layer}")
+            # Dropping the blocks above it, so `last_hidden_state` is that layer's activation
+            backbone.layers = backbone.layers[: self.args.critic_layer]
+            backbone.config.num_hidden_layers = self.args.critic_layer
         critic = nn.ModuleDict(
             {
-                "backbone": copy.deepcopy(policy_net.base_model),
+                "backbone": backbone,
                 "head": nn.Sequential(
                     nn.Linear(head_in, 1, dtype=policy_net.dtype),
                     nn.Tanh(),
@@ -35,6 +50,8 @@ class ValueFunction:
         if self.args.zero_init_value_head:
             nn.init.zeros_(critic["head"][-2].weight)
             nn.init.zeros_(critic["head"][-2].bias)
+        if self.args.target == "grpo":
+            critic.requires_grad_(False)
         return critic
 
     def _critic_params(self, model: PreTrainedModel, accelerator):
@@ -93,6 +110,11 @@ class ValueFunction:
         logits_to_keep: int,
         inputs: dict[str, torch.Tensor],
     ) -> torch.Tensor:
+        if self.args.target == "grpo":
+            lengths = inputs["completion_mask"].sum(dim=1, keepdim=True).clamp(min=1)
+            positions = torch.arange(logits_to_keep + 1, device=lengths.device).expand(lengths.size(0), -1)
+            baseline = inputs["rloo_baseline"].unsqueeze(-1)
+            return baseline + (inputs["rewards"].unsqueeze(-1) - baseline) * positions / lengths
         hidden = critic["backbone"](input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         hidden = hidden[:, -(logits_to_keep + 1) :, :]
         values = critic["head"](hidden).squeeze(-1)
@@ -109,5 +131,127 @@ class ValueFunction:
 
         return ((values[:, :-1] - target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
 
-    def log_metrics(self, metrics, inputs, advantages, values, value_loss):
-        raise NotImplementedError
+    @torch.no_grad()
+    def log_advantage_plot(self, accelerator, inputs, advantages, step, every=25):
+        """Log an HTML chart of the cumulative advantage along the completions of one prompt.
+
+        The prompt is picked among those holding both a correct and an incorrect rollout, since the point is to
+        compare how credit is spread in either case. Blue is a correct rollout, vermillion an incorrect one
+        (Okabe-Ito, which stays separable under colour-vision deficiency). Emitted as inline SVG rather than
+        through a plotting library, so it needs no dependency beyond wandb, and logged without an explicit
+        `step=`: wandb's own counter runs ahead of `global_step` and anything below it is silently discarded.
+        """
+        if step % every or step == self._last_plot_step:
+            return
+        if not (accelerator.is_main_process and is_wandb_available() and wandb.run is not None):
+            return
+        self._last_plot_step = step
+
+        mask = inputs["completion_mask"]
+        correct = inputs["rewards"] > 0
+        # `_prepare_inputs` shuffles the generation batch, so recover the groups from the prompts themselves
+        groups = {}
+        for row, prompt in enumerate(inputs["prompt_ids"].tolist()):
+            groups.setdefault(tuple(prompt), []).append(row)
+        mixed = [rows for rows in groups.values() if 0 < int(correct[rows].sum()) < len(rows)]
+        rows = (mixed or list(groups.values()))[0]
+
+        curves = []
+        for row in rows:
+            length = int(mask[row].sum())
+            if length == 0:
+                continue
+            stride = max(1, length // 400)  # keeps the payload small on long completions
+            cumulative = advantages[row, :length].float().cpu().cumsum(0)
+            curves.append((list(range(0, length, stride)), cumulative[::stride].tolist(), bool(correct[row])))
+        if not curves:
+            return
+
+        width, height, left, right, top, bottom = 860, 460, 64, 18, 32, 44
+        xmax = max(xs[-1] for xs, _, _ in curves) or 1
+        flat = [y for _, ys, _ in curves for y in ys] + [0.0]
+        lo, hi = min(flat), max(flat)
+        pad = (hi - lo) * 0.06 or 0.1
+        lo, hi = lo - pad, hi + pad
+
+        def fx(x):
+            return left + (width - left - right) * x / xmax
+
+        def fy(y):
+            return top + (height - top - bottom) * (hi - y) / (hi - lo)
+
+        svg = [f'<svg viewBox="0 0 {width} {height}" width="100%" xmlns="http://www.w3.org/2000/svg">']
+        for i in range(5):
+            y = lo + (hi - lo) * i / 4
+            svg.append(f'<line x1="{left}" y1="{fy(y):.1f}" x2="{width - right}" y2="{fy(y):.1f}" stroke="#e5e7eb"/>')
+            svg.append(f'<text x="{left - 8}" y="{fy(y) + 4:.1f}" text-anchor="end" fill="#6b7280">{y:.3g}</text>')
+            x = xmax * i / 4
+            svg.append(
+                f'<text x="{fx(x):.1f}" y="{height - bottom + 18}" text-anchor="middle" '
+                f'fill="#6b7280">{x:.0f}</text>'
+            )
+        svg.append(
+            f'<line x1="{left}" y1="{fy(0):.1f}" x2="{width - right}" y2="{fy(0):.1f}" stroke="#9ca3af" '
+            f'stroke-dasharray="2 3"/>'
+        )
+        for xs, ys, ok in curves:
+            color, label = ("#0072B2", "correct") if ok else ("#D55E00", "incorrect")
+            path = " ".join(f"{fx(x):.1f},{fy(y):.1f}" for x, y in zip(xs, ys))
+            svg.append(
+                f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="2" opacity="0.55">'
+                f"<title>{label}</title></polyline>"
+            )
+        mid = (top + height - bottom) / 2
+        svg.append(
+            f'<text x="{left}" y="18" font-size="13" fill="#111827">step {step} - {len(curves)} generations - '
+            f'mean reward {inputs["rewards"][rows].mean().item():.2f}</text>'
+        )
+        svg.append(
+            f'<text x="{(left + width - right) / 2:.0f}" y="{height - 8}" text-anchor="middle" fill="#6b7280">'
+            f"completion token</text>"
+        )
+        svg.append(
+            f'<text x="16" y="{mid:.0f}" transform="rotate(-90 16 {mid:.0f})" text-anchor="middle" fill="#6b7280">'
+            f"cumulative advantage</text>"
+        )
+        svg.append("</svg>")
+
+        legend = "".join(
+            f'<span style="margin-right:20px"><svg width="26" height="10" style="vertical-align:middle">'
+            f'<line x1="1" y1="5" x2="25" y2="5" stroke="{color}" stroke-width="2"/></svg> {text}</span>'
+            for color, text in (("#0072B2", "correct rollout"), ("#D55E00", "incorrect rollout"))
+        )
+        html = (
+            '<!DOCTYPE html><meta charset="utf-8">'
+            '<div style="background:#fff;padding:8px;color:#111827;font:11px ui-sans-serif,system-ui,sans-serif">'
+            f'{"".join(svg)}<div style="padding-top:6px;color:#374151">{legend}</div></div>'
+        )
+        wandb.log({"advantages/cumsum": wandb.Html(html, inject=False)})
+
+    def log_metrics(
+        self,
+        accelerator,
+        metrics,
+        value_loss,
+        inputs,
+        advantages,
+        values,
+        step,
+    ):
+        metrics["value_loss"].append(accelerator.gather(value_loss).nanmean().item())
+
+        # Share of the reward's variance around the group baseline that the critic explains: 0 if it does no
+        # better than predicting Rloo, 1 if it predicts R exactly, negative if it is worse than the baseline.
+        # Both sums are gathered before dividing, since a ratio cannot be averaged across ranks afterwards.
+        # Unanimous groups are dropped from both sums: their leave-one-out advantage is zero, so they add
+        # nothing to the signal while still charging their error to the residual, which only drags the ratio down.
+        rewards = inputs["rewards"].unsqueeze(-1)
+        centered = rewards - inputs["rloo_baseline"].unsqueeze(-1)
+        mask = inputs["completion_mask"] * (centered.abs() > 1e-8)
+        residual = ((values[:, :-1].detach() - rewards) ** 2 * mask).sum()
+        signal = (centered**2 * mask).sum()
+        residual, signal = accelerator.gather(residual).sum(), accelerator.gather(signal).sum()
+        if signal > 0:  # every group unanimous: the baseline already is the reward, so there is nothing to explain
+            metrics["value_ev"].append((1.0 - residual / signal).item())
+
+        self.log_advantage_plot(accelerator, inputs, advantages, step)

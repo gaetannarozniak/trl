@@ -3390,7 +3390,15 @@ class GRPOTrainer(_BaseTrainer):
 
         accumulation_factor = self.current_gradient_accumulation_steps if mode == "train" else 1.0
         loss = loss + value_loss / accumulation_factor
-        self._metrics[mode]["value_loss"].append(self.accelerator.gather(value_loss).nanmean().item())
+        self.value_function.log_metrics(
+            self.accelerator,
+            self._metrics[mode],
+            value_loss.detach(),
+            inputs,
+            advantages,
+            values,
+            self.state.global_step,
+        )
 
         # Log the metrics
         def masked_seq_mean(x):
