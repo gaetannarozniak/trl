@@ -1718,7 +1718,9 @@ class GRPOTrainer(_BaseTrainer):
             '<div style="background:#fff;padding:8px;color:#111827;font:11px ui-sans-serif,system-ui,sans-serif">'
             f'{"".join(svg)}<div style="padding-top:6px;color:#374151">{legend}</div></div>'
         )
-        wandb.log({"advantages/cumsum": wandb.Html(html, inject=False)}, step=step)
+        # No `step=`: wandb's own counter runs well ahead of `global_step` here, and logging to a step below it
+        # is silently discarded. The step is written into the figure's title instead.
+        wandb.log({"advantages/cumsum": wandb.Html(html, inject=False)})
 
     @torch.no_grad()
     def _value_advantages(self, values, advantages, mask):
