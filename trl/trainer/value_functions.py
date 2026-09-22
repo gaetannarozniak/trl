@@ -21,6 +21,7 @@ class ValueFunctionConfig:
     critic_lr: float = 1e-5
     critic_layer: int | None = None  # read the backbone after this block instead of the last one
     privileged_template: str | None = None  # extra user turn shown only to the critic, e.g. "Solution:\n{solution}"
+    probe_token: str | None = None  # interleave this token after every completion token and read the value there
     target: str = (
         "residual"  # "residual" for R - Rloo, "plain" for R, "grpo" for linear interpolation between Rloo and R
     )
@@ -34,10 +35,16 @@ class ValueFunction:
         self._last_plot_step = -1
         self._processing_class = None
         self._logged_privileged = False
+        self._probe_id = None
 
     def extra_inputs(self, rows, processing_class) -> dict[str, torch.Tensor]:
         """Privileged prompts, tokenised and merged into the batch so `get_values` can read them back."""
         self._processing_class = processing_class
+        if self.args.probe_token is not None and self._probe_id is None:
+            ids = processing_class.encode(self.args.probe_token, add_special_tokens=False)
+            if len(ids) != 1:
+                raise ValueError(f"probe_token must be a single token, {self.args.probe_token!r} is {len(ids)}")
+            self._probe_id = ids[0]
         if self.args.privileged_template is None:
             return {}
         conversation = [
@@ -126,6 +133,39 @@ class ValueFunction:
             return self._gae_advantages(values, mask)
         return (values[:, 1:] - values[:, :-1]) * mask
 
+    def _probe_hidden(self, critic, input_ids, attention_mask, logits_to_keep) -> torch.Tensor:
+        """Interleave a probe token after every completion token and read the backbone at those slots.
+
+        Nothing attends to a probe but itself, and the real tokens keep their own positions, so their forward
+        pass is the one they would have had alone. A probe takes the position of the token it precedes, so it
+        sees the same distances a real next token would.
+        """
+        B, T, device = input_ids.size(0), logits_to_keep, input_ids.device
+        P = input_ids.size(1) - T  # uniform: prompts are left-padded
+        L = P + 2 * T + 1
+
+        seq = input_ids.new_empty(B, L)
+        seq[:, :P], seq[:, P::2], seq[:, P + 1 :: 2] = input_ids[:, :P], self._probe_id, input_ids[:, P:]
+        slots = torch.arange(L, device=device)
+        position_ids = torch.where(slots < P, slots, P + (slots - P) // 2).expand(B, -1)
+
+        is_probe = torch.zeros(L, dtype=torch.bool, device=device)
+        is_probe[P::2] = True
+        valid = torch.zeros(B, L, dtype=torch.bool, device=device)
+        valid[:, :P], valid[:, P + 1 :: 2], valid[:, P::2] = attention_mask[:, :P].bool(), attention_mask[:, P:].bool(), True
+        causal = (slots.unsqueeze(0) <= slots.unsqueeze(1)) & ~is_probe
+        # the diagonal is always kept, so a padding query never gets an all-masked row and softmaxes to NaN
+        visible = (causal & valid.unsqueeze(1)) | torch.eye(L, dtype=torch.bool, device=device)
+
+        # additive, not boolean: a 4D boolean mask is cast to 1.0/0.0 and added, which masks nothing
+        dtype = critic["backbone"].get_input_embeddings().weight.dtype
+        mask = torch.zeros(B, 1, L, L, dtype=dtype, device=device)
+        mask.masked_fill_(~visible.unsqueeze(1), torch.finfo(dtype).min)
+        hidden = critic["backbone"](
+            input_ids=seq, attention_mask=mask, position_ids=position_ids
+        ).last_hidden_state
+        return hidden[:, P::2, :]
+
     def get_values(
         self,
         critic: nn.ModuleDict,
@@ -143,8 +183,11 @@ class ValueFunction:
             device = inputs["completion_ids"].device
             input_ids = torch.cat([inputs["critic_prompt_ids"].to(device), inputs["completion_ids"]], dim=1)
             attention_mask = torch.cat([inputs["critic_prompt_mask"].to(device), inputs["completion_mask"]], dim=1)
-        hidden = critic["backbone"](input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        hidden = hidden[:, -(logits_to_keep + 1) :, :]
+        if self.args.probe_token is not None:
+            hidden = self._probe_hidden(critic, input_ids, attention_mask, logits_to_keep)
+        else:
+            hidden = critic["backbone"](input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            hidden = hidden[:, -(logits_to_keep + 1) :, :]
         values = critic["head"](hidden).squeeze(-1)
         if self.args.target == "residual":
             values = values + inputs["rloo_baseline"].unsqueeze(-1)
