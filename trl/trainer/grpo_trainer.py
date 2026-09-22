@@ -57,6 +57,8 @@ from transformers import (
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.utils import is_peft_available, is_rich_available
 
+from trl.trainer.value_functions import ValueFunction, ValueFunctionConfig
+
 from ..chat_template_utils import (
     _SUPPORTS_RESPONSE_TEMPLATE,
     add_response_schema,
@@ -318,12 +320,16 @@ class GRPOTrainer(_BaseTrainer):
         tools: list[Callable] | None = None,
         rollout_func: RolloutFunc | None = None,
         environment_factory: EnvironmentFactory | dict[str, EnvironmentFactory] | None = None,
+        value_function_config: ValueFunctionConfig | None = None,
     ):
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
             model_name = model_name.split("/")[-1]
             args = GRPOConfig(f"{model_name}-GRPO")
+
+        # Value function
+        self.value_function = ValueFunction(value_function_config or ValueFunctionConfig())
 
         # Model
         if isinstance(model, str):
@@ -353,6 +359,10 @@ class GRPOTrainer(_BaseTrainer):
                     "You passed `quantization_config` to the trainer, but your model is already instantiated. The "
                     "`quantization_config` will be ignored."
                 )
+
+        # Add critic to the model so the Trainer handles its optimizer params, device placement, DDP wrapping and checkpointing
+        model.critic = self.value_function.get_critic(model)
+
         # Non-quantized models do not have the `is_loaded_in_{8,4}bit` attributes, whereas quantized models do
         _is_quantized_model = getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False)
 
@@ -1121,6 +1131,15 @@ class GRPOTrainer(_BaseTrainer):
                 logprobs=0,  # we only need the generated token logprobs for the importance sampling correction
                 generation_kwargs=args.generation_kwargs,
             )
+            # The vLLM model has no value head, so exclude it from the weight sync
+            _iter_named_params = self.vllm_generation._iter_named_params
+
+            def _iter_named_params_without_critic():
+                for name, param in _iter_named_params():
+                    if not name.startswith("critic."):
+                        yield name, param
+
+            self.vllm_generation._iter_named_params = _iter_named_params_without_critic
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
         else:
             generation_kwargs = {
@@ -1563,6 +1582,20 @@ class GRPOTrainer(_BaseTrainer):
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
         aux_loss = torch.stack(all_aux_losses).mean() if compute_aux_loss else None
         return logps, entropies, aux_loss
+
+    def create_optimizer(self, model=None):
+        """Move the critic into its own param groups so it can use `critic_learning_rate`."""
+        super().create_optimizer(model)
+        decay_parameter_names = set(self.get_decay_parameter_names(self.model))
+        return self.value_function.add_critic_optimizer(
+            self.model,
+            decay_parameter_names,
+            self.args.weight_decay,
+            self.optimizer,
+        )
+
+    def _clip_grad_norm(self, model):
+        return self.value_function._clip_grad_norm(model, self.accelerator, self.args.max_grad_norm)
 
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
@@ -2843,6 +2876,12 @@ class GRPOTrainer(_BaseTrainer):
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
 
+        # Critic targets, scrubbed of the unscorable rows' NaN and sliced like `advantages`: each rollout's own
+        # reward, and the leave-one-out mean of its group that the value head predicts the residual from
+        grouped = torch.nan_to_num(rewards, nan=0.0).view(-1, num_generations)
+        loo_baseline = (grouped.sum(dim=1, keepdim=True) - grouped) / max(num_generations - 1, 1)
+        critic_rewards, loo_baseline = grouped.flatten()[process_slice], loo_baseline.flatten()[process_slice]
+
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
             mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
@@ -2927,6 +2966,8 @@ class GRPOTrainer(_BaseTrainer):
             "completion_mask": completion_mask,
             "advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
+            "rewards": critic_rewards,
+            "rloo_baseline": loo_baseline,
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
@@ -3139,13 +3180,17 @@ class GRPOTrainer(_BaseTrainer):
             image_position_ids=inputs.get("image_position_ids"),
         )
 
+        values = self.value_function.get_values(self.model.critic, input_ids, attention_mask, logits_to_keep, inputs)
+        value_loss = self.value_function.get_value_loss(values, inputs, mask)
+
         if self.top_entropy_quantile < 1.0:
             entropy_mask = self.get_high_entropy_mask(entropies, mask, 1 - self.top_entropy_quantile)
         else:
             entropy_mask = None
 
         # Compute the loss
-        advantages = inputs["advantages"]
+        grpo_advantages = inputs["advantages"]
+        advantages = self.value_function.get_advantages(values, mask)
         # In the base GRPO implementation, advantages are expected to have shape (B,). To support subclasses that
         # provide advantages with shape (B, T) (e.g., MiniLLM), we *conditionally* unsqueeze the tensor.
         if advantages.dim() == 1:
@@ -3342,6 +3387,10 @@ class GRPOTrainer(_BaseTrainer):
             normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0
             loss = loss + self.router_aux_loss_coef * aux_loss / normalizer
             self._metrics[mode]["aux_loss"].append(self.accelerator.gather_for_metrics(aux_loss).mean().item())
+
+        accumulation_factor = self.current_gradient_accumulation_steps if mode == "train" else 1.0
+        loss = loss + value_loss / accumulation_factor
+        self._metrics[mode]["value_loss"].append(self.accelerator.gather(value_loss).nanmean().item())
 
         # Log the metrics
         def masked_seq_mean(x):
