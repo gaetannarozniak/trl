@@ -23,6 +23,21 @@ from ..import_utils import is_math_verify_available
 if is_math_verify_available():
     from latex2sympy2_extended import NormalizationConfig
     from math_verify import LatexExtractionConfig, parse, verify
+    from sympy import sstr
+
+
+def _safe_str(parsed) -> str:
+    """Stringify a parsed expression for logging, tolerating values SymPy struggles with.
+
+    `order="none"` skips the term sort the default printer applies, which reaches `evalf` and spins forever on
+    the huge powers a model occasionally emits: that hangs the rank, and with it every other rank waiting on the
+    next collective. The `except` covers printing raising outright instead, as CPython's int -> str digit limit
+    does. Only the logged string is affected, the reward is computed before this.
+    """
+    try:
+        return sstr(parsed, order="none")
+    except Exception:  # noqa: BLE001
+        return "[unprintable]"
 
 
 def accuracy_reward(
@@ -98,8 +113,8 @@ def accuracy_reward(
                 parsing_timeout=parsing_timeout,
             )
             reward = float(verify(gold_parsed, answer_parsed, timeout_seconds=verify_timeout))
-            gold_parsed_strs.append(str(gold_parsed))
-            answer_parsed_strs.append(str(answer_parsed) if answer_parsed else "[unparseable]")
+            gold_parsed_strs.append(_safe_str(gold_parsed))
+            answer_parsed_strs.append(_safe_str(answer_parsed) if answer_parsed else "[unparseable]")
         else:
             # If the gold solution cannot be parsed, we assign `None` to skip this example
             reward = None
@@ -333,8 +348,8 @@ def reasoning_accuracy_reward(
                 parsing_timeout=parsing_timeout,
             )
             reward = float(verify(gold_parsed, answer_parsed, timeout_seconds=verify_timeout))
-            gold_parsed_strs.append(str(gold_parsed))
-            answer_parsed_strs.append(str(answer_parsed) if answer_parsed else "[unparseable]")
+            gold_parsed_strs.append(_safe_str(gold_parsed))
+            answer_parsed_strs.append(_safe_str(answer_parsed) if answer_parsed else "[unparseable]")
         else:
             # If the gold solution cannot be parsed, we assign `None` to skip this example
             reward = None
