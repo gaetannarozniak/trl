@@ -2968,6 +2968,7 @@ class GRPOTrainer(_BaseTrainer):
             "num_items_in_batch": num_items_in_batch,
             "rewards": critic_rewards,
             "rloo_baseline": loo_baseline,
+            **self.value_function.extra_inputs(inputs, self.processing_class),
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps

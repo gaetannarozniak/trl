@@ -1,9 +1,12 @@
 import copy
 from dataclasses import dataclass
+from html import escape
 
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel, is_wandb_available
+
+from .utils import pad
 
 
 if is_wandb_available():
@@ -17,6 +20,7 @@ class ValueFunctionConfig:
     adv_lambda: float | None = None
     critic_lr: float = 1e-5
     critic_layer: int | None = None  # read the backbone after this block instead of the last one
+    privileged_template: str | None = None  # extra user turn shown only to the critic, e.g. "Solution:\n{solution}"
     target: str = (
         "residual"  # "residual" for R - Rloo, "plain" for R, "grpo" for linear interpolation between Rloo and R
     )
@@ -28,6 +32,26 @@ class ValueFunction:
     def __init__(self, args: ValueFunctionConfig):
         self.args = args
         self._last_plot_step = -1
+        self._processing_class = None
+        self._logged_privileged = False
+
+    def extra_inputs(self, rows, processing_class) -> dict[str, torch.Tensor]:
+        """Privileged prompts, tokenised and merged into the batch so `get_values` can read them back."""
+        self._processing_class = processing_class
+        if self.args.privileged_template is None:
+            return {}
+        conversation = [
+            row["prompt"] + [{"role": "user", "content": self.args.privileged_template.format(**row)}]
+            for row in rows
+        ]
+        ids = processing_class.apply_chat_template(
+            conversation=conversation, add_generation_prompt=True, tokenize=True, return_dict=True
+        )["input_ids"]
+        ids = [torch.tensor(i) for i in ids]
+        return {
+            "critic_prompt_ids": pad(ids, padding_value=processing_class.pad_token_id, padding_side="left"),
+            "critic_prompt_mask": pad([torch.ones_like(i) for i in ids], padding_value=0, padding_side="left"),
+        }
 
     def get_critic(self, policy_net: PreTrainedModel) -> nn.ModuleDict:
         head_in = policy_net.config.hidden_size
@@ -115,6 +139,10 @@ class ValueFunction:
             positions = torch.arange(logits_to_keep + 1, device=lengths.device).expand(lengths.size(0), -1)
             baseline = inputs["rloo_baseline"].unsqueeze(-1)
             return baseline + (inputs["rewards"].unsqueeze(-1) - baseline) * positions / lengths
+        if "critic_prompt_ids" in inputs:
+            device = inputs["completion_ids"].device
+            input_ids = torch.cat([inputs["critic_prompt_ids"].to(device), inputs["completion_ids"]], dim=1)
+            attention_mask = torch.cat([inputs["critic_prompt_mask"].to(device), inputs["completion_mask"]], dim=1)
         hidden = critic["backbone"](input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         hidden = hidden[:, -(logits_to_keep + 1) :, :]
         values = critic["head"](hidden).squeeze(-1)
@@ -130,6 +158,31 @@ class ValueFunction:
             raise NotImplementedError
 
         return ((values[:, :-1] - target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
+
+    @torch.no_grad()
+    def log_privileged_example(self, accelerator, inputs):
+        """Log one critic prompt and its generation, once, to eyeball that the privileged text is wired right."""
+        if self._logged_privileged or "critic_prompt_ids" not in inputs:
+            return
+        if not (accelerator.is_main_process and is_wandb_available() and wandb.run is not None):
+            return
+        self._logged_privileged = True
+
+        decode = self._processing_class.decode
+        prompt = decode(inputs["critic_prompt_ids"][0].tolist(), skip_special_tokens=False)
+        completion_ids = inputs["completion_ids"][0][inputs["completion_mask"][0].bool()]
+        completion = decode(completion_ids.tolist(), skip_special_tokens=False)
+        block = (
+            '<div style="white-space:pre-wrap;font:12px ui-monospace,monospace;background:{};'
+            'padding:8px;border-radius:4px;margin:4px 0 12px">{}</div>'
+        )
+        html = (
+            '<!DOCTYPE html><meta charset="utf-8">'
+            '<div style="background:#fff;padding:8px;font:13px ui-sans-serif,system-ui,sans-serif;color:#111827">'
+            f"<b>critic prompt</b>{block.format('#eff6ff', escape(prompt))}"
+            f"<b>completion</b>{block.format('#f9fafb', escape(completion))}</div>"
+        )
+        wandb.log({"privileged/example": wandb.Html(html, inject=False)})
 
     @torch.no_grad()
     def log_advantage_plot(self, accelerator, inputs, advantages, step, every=25):
@@ -254,4 +307,5 @@ class ValueFunction:
         if signal > 0:  # every group unanimous: the baseline already is the reward, so there is nothing to explain
             metrics["value_ev"].append((1.0 - residual / signal).item())
 
+        self.log_privileged_example(accelerator, inputs)
         self.log_advantage_plot(accelerator, inputs, advantages, step)
