@@ -193,12 +193,30 @@ class ValueFunction:
             values = values + inputs["rloo_baseline"].unsqueeze(-1)
         return values  # (B, logits_to_keep + 1)
 
+    @torch.no_grad()
+    def _lambda_returns(self, values: torch.Tensor, rewards: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Regression target as an exponentially weighted mix of the n-step returns, rather than the reward alone.
+
+        gamma is 1 and the only reward is terminal, so the last token bootstraps on the outcome itself:
+        `value_lambda=1` telescopes back to the plain reward, `0` regresses on the next value alone.
+        """
+        values = values.detach()
+        positions = torch.arange(mask.size(1), device=mask.device).expand_as(mask)
+        is_last = positions == mask.sum(dim=1, keepdim=True) - 1
+        deltas = (torch.where(is_last, rewards, values[:, 1:]) - values[:, :-1]) * mask
+        returns = torch.zeros_like(deltas)
+        running = torch.zeros_like(deltas[:, 0])
+        for t in range(mask.size(1) - 1, -1, -1):
+            running = deltas[:, t] + self.args.value_lambda * running * mask[:, t]
+            returns[:, t] = running
+        return returns + values[:, :-1]
+
     def get_value_loss(
         self, values: torch.Tensor, inputs: dict[str, torch.Tensor], mask: torch.Tensor
     ) -> torch.Tensor:
         target = inputs["rewards"].unsqueeze(-1)
         if self.args.value_lambda is not None:
-            raise NotImplementedError
+            target = self._lambda_returns(values, target, mask)
 
         return ((values[:, :-1] - target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
 
@@ -228,7 +246,7 @@ class ValueFunction:
         wandb.log({"privileged/example": wandb.Html(html, inject=False)})
 
     @torch.no_grad()
-    def log_advantage_plot(self, accelerator, inputs, advantages, step, every=25):
+    def log_advantage_plot(self, accelerator, inputs, advantages, step, every=50):
         """Log an HTML chart of the cumulative advantage along the completions of one prompt.
 
         The prompt is picked among those holding both a correct and an incorrect rollout, since the point is to
@@ -252,14 +270,16 @@ class ValueFunction:
         mixed = [rows for rows in groups.values() if 0 < int(correct[rows].sum()) < len(rows)]
         rows = (mixed or list(groups.values()))[0]
 
-        curves = []
+        curves, shaded = [], []
         for row in rows:
             length = int(mask[row].sum())
             if length == 0:
                 continue
             stride = max(1, length // 400)  # keeps the payload small on long completions
-            cumulative = advantages[row, :length].float().cpu().cumsum(0)
+            deltas = advantages[row, :length].float().cpu()
+            cumulative = deltas.cumsum(0)
             curves.append((list(range(0, length, stride)), cumulative[::stride].tolist(), bool(correct[row])))
+            shaded.append((row, length, deltas.tolist(), cumulative.tolist()))
         if not curves:
             return
 
@@ -290,12 +310,16 @@ class ValueFunction:
             f'<line x1="{left}" y1="{fy(0):.1f}" x2="{width - right}" y2="{fy(0):.1f}" stroke="#9ca3af" '
             f'stroke-dasharray="2 3"/>'
         )
-        for xs, ys, ok in curves:
+        for gen, (xs, ys, ok) in enumerate(curves):
             color, label = ("#0072B2", "correct") if ok else ("#D55E00", "incorrect")
             path = " ".join(f"{fx(x):.1f},{fy(y):.1f}" for x, y in zip(xs, ys))
             svg.append(
                 f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="2" opacity="0.55">'
-                f"<title>{label}</title></polyline>"
+                f"<title>gen {gen} - {label}</title></polyline>"
+            )
+            # the index at the curve's end is what ties it to the completion listed below
+            svg.append(
+                f'<text x="{fx(xs[-1]) + 4:.1f}" y="{fy(ys[-1]) + 3:.1f}" font-size="10" fill="{color}">{gen}</text>'
             )
         mid = (top + height - bottom) / 2
         svg.append(
@@ -320,9 +344,63 @@ class ValueFunction:
         html = (
             '<!DOCTYPE html><meta charset="utf-8">'
             '<div style="background:#fff;padding:8px;color:#111827;font:11px ui-sans-serif,system-ui,sans-serif">'
-            f'{"".join(svg)}<div style="padding-top:6px;color:#374151">{legend}</div></div>'
+            f'{"".join(svg)}<div style="padding-top:6px;color:#374151">{legend}</div>'
+            f"{self._completions_html(inputs, rows, shaded)}</div>"
         )
         wandb.log({"advantages/cumsum": wandb.Html(html, inject=False)})
+
+    def _completions_html(self, inputs, rows, shaded) -> str:
+        """The same generations as the curves, token by token, shaded blue for positive and red for negative.
+
+        One scale for the whole group, so intensity is comparable between generations. Tokens carry both the
+        cumulative and the per-token value, and a button swaps which one drives the colour.
+        """
+        scale_cum = max((abs(v) for _, _, _, cum in shaded for v in cum), default=0.0) or 1.0
+        scale_delta = max((abs(v) for _, _, delta, _ in shaded for v in delta), default=0.0) or 1.0
+
+        def shade(value, scale):  # white -> #2166ac positive, white -> #b2182b negative (ColorBrewer RdBu)
+            t = max(-1.0, min(1.0, value / scale))
+            r, g, b = (33, 102, 172) if t > 0 else (178, 24, 43)
+            t = abs(t)
+            return f"#{round(255 - (255 - r) * t):02x}{round(255 - (255 - g) * t):02x}{round(255 - (255 - b) * t):02x}"
+
+        prompt_ids = inputs.get("critic_prompt_ids", inputs["prompt_ids"])
+        prompt = escape(self._processing_class.decode(prompt_ids[rows[0]].tolist(), skip_special_tokens=True))
+        blocks = [
+            '<details open style="margin-top:10px"><summary style="cursor:pointer;color:#374151">prompt</summary>'
+            f'<div style="white-space:pre-wrap;font:12px ui-monospace,monospace;background:#f9fafb;padding:8px;'
+            f'border-radius:4px;margin:4px 0">{prompt}</div></details>'
+        ]
+        for gen, (row, length, delta, cum) in enumerate(shaded):
+            pieces = self._processing_class.batch_decode(
+                [[i] for i in inputs["completion_ids"][row, :length].tolist()]
+            )
+            spans = [
+                f'<span data-c="{shade(cum[i], scale_cum)}" data-d="{shade(delta[i], scale_delta)}" '
+                f'style="background:{shade(cum[i], scale_cum)}" '
+                f'title="token {i} | cumsum {cum[i]:+.4g} | delta {delta[i]:+.4g}">{escape(piece)}</span>'
+                for i, piece in enumerate(pieces)
+            ]
+            ok = bool(inputs["rewards"][row] > 0)
+            colour, verdict = ("#0072B2", "&#10003; correct") if ok else ("#D55E00", "&#10007; incorrect")
+            # collapsed by default: 16 full completions is a lot to scroll past to reach the one you want
+            blocks.append(
+                f'<details style="margin-top:6px"><summary style="cursor:pointer">'
+                f'<span style="font-weight:600;color:{colour}">gen {gen}</span> '
+                f'<span style="color:{colour}">{verdict}</span> '
+                f'<span style="color:#6b7280">R={inputs["rewards"][row].item():.2f} &middot; '
+                f"sum={cum[-1]:+.3g} &middot; {length} tokens</span></summary>"
+                f'<div style="white-space:pre-wrap;font:12px ui-monospace,monospace;border:1px solid #e5e7eb;'
+                f'border-radius:4px;padding:6px;margin-top:3px">{"".join(spans)}</div></details>'
+            )
+        return (
+            '<div style="margin-top:12px;border-top:1px solid #e5e7eb;padding-top:8px">'
+            '<button onclick="var c=this.dataset.m!==\'d\';this.dataset.m=c?\'d\':\'c\';'
+            "this.textContent='colour: '+(c?'per-token':'cumsum');"
+            'document.querySelectorAll(\'[data-c]\').forEach(function(s){s.style.background=c?s.dataset.d:s.dataset.c;});" '
+            'style="cursor:pointer;font:11px ui-sans-serif,system-ui,sans-serif;padding:3px 8px">'
+            "colour: cumsum</button>" + "".join(blocks) + "</div>"
+        )
 
     def log_metrics(
         self,
