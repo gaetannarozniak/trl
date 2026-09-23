@@ -17,6 +17,7 @@ if is_wandb_available():
 class ValueFunctionConfig:
     zero_init_value_head: bool = True
     value_lambda: float | None = None
+    value_loss_skip_unanimous: bool = False  # drop groups whose rollouts all agree from the value loss
     adv_lambda: float | None = None
     critic_lr: float = 1e-5
     critic_layer: int | None = None  # read the backbone after this block instead of the last one
@@ -217,6 +218,9 @@ class ValueFunction:
         target = inputs["rewards"].unsqueeze(-1)
         if self.args.value_lambda is not None:
             target = self._lambda_returns(values, target, mask)
+        if self.args.value_loss_skip_unanimous:  # after the scan, so the recursion keeps its own row lengths
+            centered = inputs["rewards"] - inputs["rloo_baseline"]
+            mask = mask * (centered.abs() > 1e-8).to(mask.dtype).unsqueeze(-1)
 
         return ((values[:, :-1] - target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
 
