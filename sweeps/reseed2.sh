@@ -7,7 +7,7 @@ TPL_SHORT=$'Ground truth solution:\n{solution}'
 TPL_LONG=$'Hint: the ground truth solution is\n{solution}. Output after [[ your estimate of the probability that you will output the correct solution at the end of your answer.'
 DELAY=0
 n=0
-sub() { n=$((n+1)); [ $n -gt 1 ] && ${DRY:+echo }sleep "$DELAY"; ${DRY:+echo }sbatch --qos=g3_core_shared my_grpo.sbatch "$@"; }
+sub() { n=$((n+1)); [ $n -gt 1 ] && ${DRY:+echo }sleep "$DELAY"; ${DRY:+echo }sbatch --qos="${QOS:-g3_core_shared}" my_grpo.sbatch "$@"; }
 
 for s in 1 2; do
   sub --expe_name "0_plr0|residual|s$s"                          --learning_rate 0 --seed $s --target residual

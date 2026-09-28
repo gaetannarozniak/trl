@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."   # sbatch paths below are relative to the repo root
 
 TPL_SHORT=$'Ground truth solution:\n{solution}'
 TPL_LONG=$'Hint: the ground truth solution is\n{solution}. Output after [[ your estimate of the probability that you will output the correct solution at the end of your answer.'
-SUB="${DRY:+echo }sbatch --qos=g3_core_shared my_grpo.sbatch"
+SUB="${DRY:+echo }sbatch --qos="${QOS:-g3_core_shared}" my_grpo.sbatch"
 
 for s in 1 2; do
   $SUB --expe_name "plr0|residual|s$s"                                    --learning_rate 0 --seed $s --target residual
