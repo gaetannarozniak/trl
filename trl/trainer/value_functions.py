@@ -1,4 +1,5 @@
 import copy
+import time
 from dataclasses import dataclass
 from html import escape
 
@@ -7,6 +8,13 @@ import torch.nn as nn
 from transformers import PreTrainedModel, is_wandb_available
 
 from .utils import pad
+from .value_function_prompts import (
+    ANALYSIS_ATTEMPT,
+    ANALYSIS_MARKER,
+    ANALYSIS_PREFILL,
+    ANALYSIS_PROMPT,
+    ANALYSIS_ATTEMPT_TOKENS,
+)
 
 
 if is_wandb_available():
@@ -26,6 +34,18 @@ class ValueFunctionConfig:
     target: str = (
         "residual"  # "residual" for R - Rloo, "plain" for R, "grpo" for linear interpolation between Rloo and R
     )
+    analysis_model: str | None = None  # frozen model that reviews a group's rollouts into `{analysis}`
+    analysis_max_tokens: int = 4096
+    analysis_gpu_memory_utilization: float = 0.05  # ~14 GiB, against ~4 actually needed
+    analysis_max_model_length: int = 32768
+
+    def __post_init__(self):
+        if self.analysis_model is None:
+            return
+        if not self.value_loss_skip_unanimous:
+            raise ValueError("analysis_model requires value_loss_skip_unanimous=True")
+        if self.privileged_template is None or "{analysis}" not in self.privileged_template:
+            raise ValueError("analysis_model requires `{analysis}` in privileged_template")
 
 
 # maybe still need to deal with the vllm iter_name_params for the critic, it seems redundant in the way we find the critic params (already two ways)
@@ -37,8 +57,12 @@ class ValueFunction:
         self._processing_class = None
         self._logged_privileged = False
         self._probe_id = None
+        self._analyser = None
+        self._analysis_example = None
+        self._analysis_stats = {}
+        self._logged_analysis = False
 
-    def extra_inputs(self, rows, processing_class) -> dict[str, torch.Tensor]:
+    def extra_inputs(self, rows, processing_class, completions=None, rewards=None, args=None) -> dict:
         """Privileged prompts, tokenised and merged into the batch so `get_values` can read them back."""
         self._processing_class = processing_class
         if self.args.probe_token is not None and self._probe_id is None:
@@ -48,9 +72,10 @@ class ValueFunction:
             self._probe_id = ids[0]
         if self.args.privileged_template is None:
             return {}
+        analyses = self._group_analyses(rows, completions, rewards, args)
         conversation = [
-            row["prompt"] + [{"role": "user", "content": self.args.privileged_template.format(**row)}]
-            for row in rows
+            row["prompt"] + [{"role": "user", "content": self.args.privileged_template.format(**row, **extra)}]
+            for row, extra in zip(rows, analyses)
         ]
         ids = processing_class.apply_chat_template(
             conversation=conversation, add_generation_prompt=True, tokenize=True, return_dict=True
@@ -60,6 +85,114 @@ class ValueFunction:
             "critic_prompt_ids": pad(ids, padding_value=processing_class.pad_token_id, padding_side="left"),
             "critic_prompt_mask": pad([torch.ones_like(i) for i in ids], padding_value=0, padding_side="left"),
         }
+
+    def _n_tokens(self, text: str) -> int:
+        return len(self._processing_class(text, add_special_tokens=False)["input_ids"])
+
+    @staticmethod
+    def _extract_block(out: str) -> str:
+        """The two headed lists from the analyser's reply, dropping its reasoning and anything trailing."""
+        if ANALYSIS_MARKER not in out:
+            return ""
+        kept = []
+        for line in out[out.index(ANALYSIS_MARKER) :].splitlines():
+            line = line.rstrip()
+            if line in (ANALYSIS_MARKER, "CORRECT:") or line.startswith("- "):
+                kept.append(line)
+            elif kept and line:  # prose, a fence, anything else: the block is over
+                break
+        return "\n".join(kept)
+
+    def _group_analyses(self, rows, completions, rewards, args) -> list[dict]:
+        """One `{analysis}` per row: a frozen model reviews the whole group's rollouts against the reference.
+
+        Unanimous groups are skipped, since `value_loss_skip_unanimous` gives their rows no loss weight anyway.
+        """
+        if self.args.analysis_model is None:
+            return [{} for _ in rows]
+        from vllm import LLM, SamplingParams
+
+        if self._analyser is None:
+            self._analyser = LLM(
+                model=self.args.analysis_model,
+                gpu_memory_utilization=self.args.analysis_gpu_memory_utilization,
+                max_model_len=self.args.analysis_max_model_length,
+                # one sequence per group; the default of 256 makes the profiling pass allocate enormously
+                max_num_seqs=max(1, args.per_device_train_batch_size // args.num_generations),
+                # both as in VLLMGeneration: use this rank's device rather than cuda:0, and keep the v1 memory
+                # profiler from being misled by the default 32768
+                distributed_executor_backend="external_launcher",
+                max_num_batched_tokens=4096,
+                enforce_eager=True,
+            )
+        sampling = SamplingParams(
+            n=1,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k or -1,
+            min_p=args.min_p or 0.0,
+            repetition_penalty=args.repetition_penalty,
+            max_tokens=self.args.analysis_max_tokens,
+        )
+
+        groups = {}
+        for row, prompt in enumerate(str(r["prompt"]) for r in rows):
+            groups.setdefault(prompt, []).append(row)
+        groups = [g for g in groups.values() if 0 < sum(rewards[i] > 0 for i in g) < len(g)]
+
+        prompts, truncated, total = [], 0, 0
+        for g in groups:
+            question, solution = rows[g[0]]["prompt"][-1]["content"], rows[g[0]]["solution"]
+            scaffold = ANALYSIS_PROMPT.format(question=question, solution=solution, n=len(g), attempts="")
+            # what the attempts may occupy once the output and the measured scaffolding have their share
+            room = self.args.analysis_max_model_length - self.args.analysis_max_tokens - self._n_tokens(scaffold)
+            keep = max(1, room // len(g) - ANALYSIS_ATTEMPT_TOKENS)  # end of each attempt: that is where it lands
+
+            texts = [completions[i][0]["content"] if isinstance(completions[i], list) else completions[i] for i in g]
+            ids = self._processing_class(texts, add_special_tokens=False)["input_ids"]
+            truncated += sum(len(x) > keep for x in ids)
+            total += len(texts)
+            texts = [self._processing_class.decode(x[-keep:]) if len(x) > keep else t for x, t in zip(ids, texts)]
+            attempts = "\n\n".join(
+                ANALYSIS_ATTEMPT.format(i=n + 1, verdict="CORRECT" if rewards[i] > 0 else "WRONG", completion=text)
+                for n, (i, text) in enumerate(zip(g, texts))
+            )
+            text = ANALYSIS_PROMPT.format(question=question, solution=solution, n=len(g), attempts=attempts)
+            # prefill the reasoning header, or a small model just copies the block template and skips it
+            prompts.append(
+                self._processing_class.apply_chat_template(
+                    [{"role": "user", "content": text}], add_generation_prompt=True, tokenize=False
+                )
+                + ANALYSIS_PREFILL
+            )
+
+        analyses = [{"analysis": ""} for _ in rows]
+        if not prompts:
+            self._analysis_stats = {"analysis/seconds": 0.0, "analysis/groups": 0}
+            return analyses
+        started = time.perf_counter()
+        outputs = [o.outputs[0].text for o in self._analyser.generate(prompts, sampling)]
+        elapsed = time.perf_counter() - started
+        failures, raw_len, kept_len = 0, [], []
+        for g, prompt, out in zip(groups, prompts, outputs):
+            raw_len.append(len(out))
+            kept = self._extract_block(out)
+            failures += kept == ""
+            kept_len.append(len(kept))
+            for i in g:
+                analyses[i] = {"analysis": kept}
+            if self._analysis_example is None:
+                self._analysis_example = (prompt, out, kept)
+        self._analysis_stats = {
+            "analysis/seconds": elapsed,
+            "analysis/groups": len(outputs),
+            "analysis/format_failure_rate": failures / len(outputs),
+            "analysis/raw_chars": sum(raw_len) / len(raw_len),
+            "analysis/extracted_chars": sum(kept_len) / len(kept_len),
+            "analysis/clipped_rate": sum(len(o) >= 4 * self.args.analysis_max_tokens for o in outputs) / len(outputs),
+            "analysis/truncated_rate": truncated / max(total, 1),
+        }
+        return analyses
 
     def get_critic(self, policy_net: PreTrainedModel) -> nn.ModuleDict:
         head_in = policy_net.config.hidden_size
@@ -250,6 +383,27 @@ class ValueFunction:
         wandb.log({"privileged/example": wandb.Html(html, inject=False)})
 
     @torch.no_grad()
+    def log_analysis_example(self, accelerator):
+        """Log one analyser prompt with its full answer and the extracted block, once."""
+        if self._logged_analysis or self._analysis_example is None:
+            return
+        if not (accelerator.is_main_process and is_wandb_available() and wandb.run is not None):
+            return
+        self._logged_analysis = True
+        block = (
+            '<b>{}</b><div style="white-space:pre-wrap;font:12px ui-monospace,monospace;background:{};'
+            'padding:8px;border-radius:4px;margin:4px 0 12px">{}</div>'
+        )
+        sections = zip(("analyser prompt", "raw answer", "extracted"), ("#eff6ff", "#f9fafb", "#ecfdf5"))
+        html = (
+            '<!DOCTYPE html><meta charset="utf-8">'
+            '<div style="background:#fff;padding:8px;font:13px ui-sans-serif,system-ui,sans-serif;color:#111827">'
+            + "".join(block.format(t, c, escape(x)) for (t, c), x in zip(sections, self._analysis_example))
+            + "</div>"
+        )
+        wandb.log({"analysis/example": wandb.Html(html, inject=False)})
+
+    @torch.no_grad()
     def log_advantage_plot(self, accelerator, inputs, advantages, step, every=50):
         """Log an HTML chart of the cumulative advantage along the completions of one prompt.
 
@@ -432,5 +586,8 @@ class ValueFunction:
         if signal > 0:  # every group unanimous: the baseline already is the reward, so there is nothing to explain
             metrics["value_ev"].append((1.0 - residual / signal).item())
 
+        for key, value in self._analysis_stats.items():
+            metrics[key].append(value)
         self.log_privileged_example(accelerator, inputs)
+        self.log_analysis_example(accelerator)
         self.log_advantage_plot(accelerator, inputs, advantages, step)
