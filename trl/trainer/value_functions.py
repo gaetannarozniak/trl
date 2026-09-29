@@ -31,6 +31,7 @@ class ValueFunctionConfig:
     critic_layer: int | None = None  # read the backbone after this block instead of the last one
     privileged_template: str | None = None  # extra user turn shown only to the critic, e.g. "Solution:\n{solution}"
     probe_token: str | None = None  # interleave this token after every completion token and read the value there
+    yes_no_tokens_as_value: bool = False  # read the value as p(yes) / (p(yes) + p(no)) at the probe slots
     target: str = (
         "residual"  # "residual" for R - Rloo, "plain" for R, "grpo" for linear interpolation between Rloo and R
     )
@@ -40,6 +41,8 @@ class ValueFunctionConfig:
     analysis_max_model_length: int = 32768
 
     def __post_init__(self):
+        if self.yes_no_tokens_as_value and self.probe_token is None:
+            raise ValueError("yes_no_tokens_as_value requires probe_token")
         if self.analysis_model is None:
             return
         if not self.value_loss_skip_unanimous:
@@ -57,6 +60,9 @@ class ValueFunction:
         self._processing_class = None
         self._logged_privileged = False
         self._probe_id = None
+        self._yes_ids = None
+        self._no_ids = None
+        self._policy_head = None
         self._analyser = None
         self._analysis_example = None
         self._analysis_stats = {}
@@ -70,6 +76,24 @@ class ValueFunction:
             if len(ids) != 1:
                 raise ValueError(f"probe_token must be a single token, {self.args.probe_token!r} is {len(ids)}")
             self._probe_id = ids[0]
+        if self.args.yes_no_tokens_as_value and self._yes_ids is None:
+            # Every vocab token starting with "yes" or "no", ignoring case and leading space
+            texts = processing_class.batch_decode([[i] for i in range(processing_class.vocab_size)])
+            special = set(processing_class.all_special_ids)
+            yes, no = [], []
+            for i, text in enumerate(texts):
+                if i in special:
+                    continue
+                text = text.casefold().lstrip()
+                if text.startswith("yes"):
+                    yes.append(i)
+                elif text.startswith("no"):
+                    no.append(i)
+            both = set(yes) & set(no)
+            self._yes_ids = [i for i in yes if i not in both]
+            self._no_ids = [i for i in no if i not in both]
+            if not self._yes_ids or not self._no_ids:
+                raise ValueError("yes_no_tokens_as_value found no 'yes' or no 'no' tokens in the vocabulary")
         if self.args.privileged_template is None:
             return {}
         analyses = self._group_analyses(rows, completions, rewards, args)
@@ -215,6 +239,10 @@ class ValueFunction:
         if self.args.zero_init_value_head:
             nn.init.zeros_(critic["head"][-2].weight)
             nn.init.zeros_(critic["head"][-2].bias)
+        critic["head"].requires_grad_(not self.args.yes_no_tokens_as_value)
+        # Shared with the policy, not a copy: no extra memory or state_dict entry, and it tracks the policy's
+        # device. Deliberately not frozen: freezing would freeze the policy's own lm_head.
+        self._policy_head = policy_net.get_output_embeddings()
         if self.args.target == "grpo":
             critic.requires_grad_(False)
         return critic
@@ -300,6 +328,13 @@ class ValueFunction:
         ).last_hidden_state
         return hidden[:, P::2, :]
 
+    def _yes_no_values(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Value as the normalised yes-probability at each probe slot: `2 * p(yes) / (p(yes) + p(no)) - 1`."""
+        logits = self._policy_head(hidden).float()
+        yes = torch.logsumexp(logits[..., self._yes_ids], dim=-1)
+        no = torch.logsumexp(logits[..., self._no_ids], dim=-1)
+        return 2 * torch.sigmoid(yes - no) - 1
+
     def get_values(
         self,
         critic: nn.ModuleDict,
@@ -322,7 +357,10 @@ class ValueFunction:
         else:
             hidden = critic["backbone"](input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
             hidden = hidden[:, -(logits_to_keep + 1) :, :]
-        values = critic["head"](hidden).squeeze(-1)
+        if self.args.yes_no_tokens_as_value:
+            values = self._yes_no_values(hidden)
+        else:
+            values = critic["head"](hidden).squeeze(-1)
         if self.args.target == "residual":
             values = values + inputs["rloo_baseline"].unsqueeze(-1)
         return values  # (B, logits_to_keep + 1)
