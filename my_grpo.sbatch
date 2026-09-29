@@ -32,6 +32,16 @@ source .venv/bin/activate
 # the local cache already, so resolve from there and never reach for the network.
 export HF_HUB_OFFLINE=1
 
+# The fp32 logits are one 37 GiB block (batch x completion x 152k vocab). With a second vLLM engine resident
+# there is no contiguous room for it, and the allocator falls back to cudaMalloc/cudaFree every step.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# Triton defaults its cache to ~/.triton, which is NFS: the four vLLM engines compile the same kernels at the
+# same instant and one rank's atomic rename replaces a file another already has open, which surfaces as
+# `OSError: [Errno 116] Stale file handle`. /tmp is node-local, and one tree per job cannot collide at all.
+export TRITON_CACHE_DIR=/tmp/triton-$USER-$SLURM_JOB_ID
+export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor-$USER-$SLURM_JOB_ID
+
 echo "job $SLURM_JOB_ID (${NAME:-unnamed}) on $(hostname) | gpus=$SLURM_GPUS_ON_NODE cpus=$SLURM_CPUS_ON_NODE"
 
 accelerate launch --num_processes 4 trl/scripts/my_grpo.py "$@"

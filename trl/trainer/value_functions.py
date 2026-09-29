@@ -219,7 +219,7 @@ class ValueFunction:
         return analyses
 
     def get_critic(self, policy_net: PreTrainedModel) -> nn.ModuleDict:
-        head_in = policy_net.config.hidden_size
+        head_in = policy_net.config.get_text_config().hidden_size
         backbone = copy.deepcopy(policy_net.base_model)
         if self.args.critic_layer is not None:
             if not 1 <= self.args.critic_layer <= len(backbone.layers):
