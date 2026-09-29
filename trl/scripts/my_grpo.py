@@ -1,7 +1,7 @@
 import os
 
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, TrainerCallback
 from transformers.models.olmo3.modeling_olmo3 import Olmo3Model
 
 from trl import GRPOConfig, GRPOTrainer, TrlParser
@@ -15,7 +15,6 @@ os.environ["WANDB_PROJECT"] = "value_function3"
 # process; the policy and its critic copy predate the engine and miss the `do_not_compile` that the
 # decorated __call__ reads. vLLM's own instances set it in __init__ and shadow this default.
 Olmo3Model.do_not_compile = True
-
 
 # Defaults for this experiment. Any of them, and any other GRPOConfig or ValueFunctionConfig field, can be
 # overridden from the command line, e.g. `--learning_rate 1e-5 --critic_lr 1e-4 --target plain`.
@@ -34,6 +33,19 @@ DEFAULTS = {
     "num_generations": 16,
     "scale_rewards": "none",
 }
+
+
+class DropEmbeddingGradHook(TrainerCallback):
+    """Undo the hook `gradient_checkpointing_enable` puts on the input embeddings.
+
+    It forces the embedding output to require grad so that gradients reach LoRA layers under a frozen base
+    model. With the whole policy frozen that only rebuilds a graph nothing consumes, which costs the saved
+    activations and a backward pass. It is installed inside `train()`, hence a callback rather than a line
+    next to the freeze below.
+    """
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        model.disable_input_require_grads()
 
 
 def main():
@@ -81,6 +93,15 @@ def main():
         ),
         value_function_config=value_function_config,
     )
+
+    # At lr 0 the policy never moves, so it needs no gradients, no Adam states, no saved activations and no
+    # backward: freezing it leaves only the critic in the graph.
+    if config.learning_rate == 0:
+        for name, param in trainer.model.named_parameters():
+            if not name.startswith("critic."):
+                param.requires_grad_(False)
+        trainer.add_callback(DropEmbeddingGradHook())
+
     trainer.train()
 
 

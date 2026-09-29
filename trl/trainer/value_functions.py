@@ -1,3 +1,4 @@
+import collections
 import copy
 import time
 from dataclasses import dataclass
@@ -60,6 +61,12 @@ class ValueFunction:
         self._processing_class = None
         self._logged_privileged = False
         self._probe_id = None
+        self._pending_curves = {}
+        # Seconds spent in the critic, summed over the micro-batches of one optimizer step and flushed by
+        # log_metrics, the same way _analysis_stats is. `step_time` is per optimizer step and covers
+        # generation, every forward and backward and the optimizer, so subtracting these leaves the policy.
+        self._times = collections.defaultdict(float)
+        self._num_generations = None
         self._yes_ids = None
         self._no_ids = None
         self._policy_head = None
@@ -71,6 +78,8 @@ class ValueFunction:
     def extra_inputs(self, rows, processing_class, completions=None, rewards=None, args=None) -> dict:
         """Privileged prompts, tokenised and merged into the batch so `get_values` can read them back."""
         self._processing_class = processing_class
+        if args is not None:  # absent only when called directly from a test
+            self._num_generations = args.num_generations
         if self.args.probe_token is not None and self._probe_id is None:
             ids = processing_class.encode(self.args.probe_token, add_special_tokens=False)
             if len(ids) != 1:
@@ -280,9 +289,13 @@ class ValueFunction:
         return optimizer
 
     def _clip_grad_norm(self, model: PreTrainedModel, accelerator, grad_norm: float):
+        start = time.perf_counter()
         critic, policy = self._critic_params(model, accelerator)
         accelerator.clip_grad_norm_(critic, grad_norm)
-        return accelerator.clip_grad_norm_(policy, grad_norm)
+        norm = accelerator.clip_grad_norm_(policy, grad_norm)
+        # Once per optimizer step, but over every parameter of both models, which is not free at this size.
+        self._times["time/clip_grad_norm"] += time.perf_counter() - start
+        return norm
 
     @torch.no_grad()
     def _gae_advantages(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -336,6 +349,20 @@ class ValueFunction:
         return 2 * torch.sigmoid(yes - no) - 1
 
     def get_values(
+        self,
+        critic: nn.ModuleDict,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        logits_to_keep: int,
+        inputs: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        start = time.perf_counter()
+        try:
+            return self._get_values(critic, input_ids, attention_mask, logits_to_keep, inputs)
+        finally:
+            self._times["time/critic_forward"] += time.perf_counter() - start
+
+    def _get_values(
         self,
         critic: nn.ModuleDict,
         input_ids: torch.Tensor,
@@ -442,11 +469,13 @@ class ValueFunction:
         wandb.log({"analysis/example": wandb.Html(html, inject=False)})
 
     @torch.no_grad()
-    def log_advantage_plot(self, accelerator, inputs, advantages, step, every=50):
+    def log_advantage_plot(self, accelerator, inputs, advantages, step, every=10):
         """Log an HTML chart of the cumulative advantage along the completions of one prompt.
 
-        The prompt is picked among those holding both a correct and an incorrect rollout, since the point is to
-        compare how credit is spread in either case. Blue is a correct rollout, vermillion an incorrect one
+        A group's `num_generations` rollouts are shuffled across the micro-batches of one optimizer step, so
+        each call contributes the few rows it holds and the chart is emitted once a group is whole. The group
+        is picked among those holding both a correct and an incorrect rollout, since the point is to compare
+        how credit is spread in either case. Blue is a correct rollout, vermillion an incorrect one
         (Okabe-Ito, which stays separable under colour-vision deficiency). Emitted as inline SVG rather than
         through a plotting library, so it needs no dependency beyond wandb, and logged without an explicit
         `step=`: wandb's own counter runs ahead of `global_step` and anything below it is silently discarded.
@@ -455,29 +484,39 @@ class ValueFunction:
             return
         if not (accelerator.is_main_process and is_wandb_available() and wandb.run is not None):
             return
-        self._last_plot_step = step
 
         mask = inputs["completion_mask"]
         correct = inputs["rewards"] > 0
-        # `_prepare_inputs` shuffles the generation batch, so recover the groups from the prompts themselves
-        groups = {}
+        prompt_ids = inputs.get("critic_prompt_ids", inputs["prompt_ids"])
         for row, prompt in enumerate(inputs["prompt_ids"].tolist()):
-            groups.setdefault(tuple(prompt), []).append(row)
-        mixed = [rows for rows in groups.values() if 0 < int(correct[rows].sum()) < len(rows)]
-        rows = (mixed or list(groups.values()))[0]
-
-        curves, shaded = [], []
-        for row in rows:
             length = int(mask[row].sum())
             if length == 0:
                 continue
-            stride = max(1, length // 400)  # keeps the payload small on long completions
             deltas = advantages[row, :length].float().cpu()
             cumulative = deltas.cumsum(0)
-            curves.append((list(range(0, length, stride)), cumulative[::stride].tolist(), bool(correct[row])))
-            shaded.append((row, length, deltas.tolist(), cumulative.tolist()))
-        if not curves:
+            self._pending_curves.setdefault(tuple(prompt), []).append(
+                {
+                    "prompt_ids": prompt_ids[row].tolist(),
+                    "completion_ids": inputs["completion_ids"][row, :length].tolist(),
+                    "reward": inputs["rewards"][row].item(),
+                    "ok": bool(correct[row]),
+                    "delta": deltas.tolist(),
+                    "cum": cumulative.tolist(),
+                }
+            )
+        whole = [rollouts for rollouts in self._pending_curves.values() if len(rollouts) >= self._num_generations]
+        if not whole:
             return
+        mixed = [rollouts for rollouts in whole if 0 < sum(r["ok"] for r in rollouts) < len(rollouts)]
+        group = (mixed or whole)[0]
+        self._last_plot_step = step
+        self._pending_curves.clear()
+
+        curves = []
+        for r in group:
+            length = len(r["delta"])
+            stride = max(1, length // 400)  # keeps the payload small on long completions
+            curves.append((list(range(0, length, stride)), r["cum"][::stride], r["ok"]))
 
         width, height, left, right, top, bottom = 860, 460, 64, 18, 32, 44
         xmax = max(xs[-1] for xs, _, _ in curves) or 1
@@ -520,7 +559,7 @@ class ValueFunction:
         mid = (top + height - bottom) / 2
         svg.append(
             f'<text x="{left}" y="18" font-size="13" fill="#111827">step {step} - {len(curves)} generations - '
-            f'mean reward {inputs["rewards"][rows].mean().item():.2f}</text>'
+            f'mean reward {sum(r["reward"] for r in group) / len(group):.2f}</text>'
         )
         svg.append(
             f'<text x="{(left + width - right) / 2:.0f}" y="{height - 8}" text-anchor="middle" fill="#6b7280">'
@@ -541,18 +580,18 @@ class ValueFunction:
             '<!DOCTYPE html><meta charset="utf-8">'
             '<div style="background:#fff;padding:8px;color:#111827;font:11px ui-sans-serif,system-ui,sans-serif">'
             f'{"".join(svg)}<div style="padding-top:6px;color:#374151">{legend}</div>'
-            f"{self._completions_html(inputs, rows, shaded)}</div>"
+            f"{self._completions_html(group)}</div>"
         )
         wandb.log({"advantages/cumsum": wandb.Html(html, inject=False)})
 
-    def _completions_html(self, inputs, rows, shaded) -> str:
+    def _completions_html(self, group) -> str:
         """The same generations as the curves, token by token, shaded blue for positive and red for negative.
 
         One scale for the whole group, so intensity is comparable between generations. Tokens carry both the
         cumulative and the per-token value, and a button swaps which one drives the colour.
         """
-        scale_cum = max((abs(v) for _, _, _, cum in shaded for v in cum), default=0.0) or 1.0
-        scale_delta = max((abs(v) for _, _, delta, _ in shaded for v in delta), default=0.0) or 1.0
+        scale_cum = max((abs(v) for r in group for v in r["cum"]), default=0.0) or 1.0
+        scale_delta = max((abs(v) for r in group for v in r["delta"]), default=0.0) or 1.0
 
         def shade(value, scale):  # white -> #2166ac positive, white -> #b2182b negative (ColorBrewer RdBu)
             t = max(-1.0, min(1.0, value / scale))
@@ -560,31 +599,28 @@ class ValueFunction:
             t = abs(t)
             return f"#{round(255 - (255 - r) * t):02x}{round(255 - (255 - g) * t):02x}{round(255 - (255 - b) * t):02x}"
 
-        prompt_ids = inputs.get("critic_prompt_ids", inputs["prompt_ids"])
-        prompt = escape(self._processing_class.decode(prompt_ids[rows[0]].tolist(), skip_special_tokens=True))
+        prompt = escape(self._processing_class.decode(group[0]["prompt_ids"], skip_special_tokens=True))
         blocks = [
             '<details open style="margin-top:10px"><summary style="cursor:pointer;color:#374151">prompt</summary>'
             f'<div style="white-space:pre-wrap;font:12px ui-monospace,monospace;background:#f9fafb;padding:8px;'
             f'border-radius:4px;margin:4px 0">{prompt}</div></details>'
         ]
-        for gen, (row, length, delta, cum) in enumerate(shaded):
-            pieces = self._processing_class.batch_decode(
-                [[i] for i in inputs["completion_ids"][row, :length].tolist()]
-            )
+        for gen, r in enumerate(group):
+            delta, cum, length = r["delta"], r["cum"], len(r["delta"])
+            pieces = self._processing_class.batch_decode([[i] for i in r["completion_ids"]])
             spans = [
                 f'<span data-c="{shade(cum[i], scale_cum)}" data-d="{shade(delta[i], scale_delta)}" '
                 f'style="background:{shade(cum[i], scale_cum)}" '
                 f'title="token {i} | cumsum {cum[i]:+.4g} | delta {delta[i]:+.4g}">{escape(piece)}</span>'
                 for i, piece in enumerate(pieces)
             ]
-            ok = bool(inputs["rewards"][row] > 0)
-            colour, verdict = ("#0072B2", "&#10003; correct") if ok else ("#D55E00", "&#10007; incorrect")
+            colour, verdict = ("#0072B2", "&#10003; correct") if r["ok"] else ("#D55E00", "&#10007; incorrect")
             # collapsed by default: 16 full completions is a lot to scroll past to reach the one you want
             blocks.append(
                 f'<details style="margin-top:6px"><summary style="cursor:pointer">'
                 f'<span style="font-weight:600;color:{colour}">gen {gen}</span> '
                 f'<span style="color:{colour}">{verdict}</span> '
-                f'<span style="color:#6b7280">R={inputs["rewards"][row].item():.2f} &middot; '
+                f'<span style="color:#6b7280">R={r["reward"]:.2f} &middot; '
                 f"sum={cum[-1]:+.3g} &middot; {length} tokens</span></summary>"
                 f'<div style="white-space:pre-wrap;font:12px ui-monospace,monospace;border:1px solid #e5e7eb;'
                 f'border-radius:4px;padding:6px;margin-top:3px">{"".join(spans)}</div></details>'
@@ -626,6 +662,9 @@ class ValueFunction:
 
         for key, value in self._analysis_stats.items():
             metrics[key].append(value)
+        for key, value in self._times.items():
+            metrics[key].append(value)
+        self._times.clear()
         self.log_privileged_example(accelerator, inputs)
         self.log_analysis_example(accelerator)
         self.log_advantage_plot(accelerator, inputs, advantages, step)
