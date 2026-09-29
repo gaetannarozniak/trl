@@ -1,6 +1,7 @@
 import os
 
 from datasets import load_dataset
+from transformers import AutoProcessor
 
 from trl import GRPOConfig, GRPOTrainer, TrlParser
 from trl.rewards import accuracy_reward
@@ -31,6 +32,12 @@ DEFAULTS = {
 def main():
     parser = TrlParser(dataclass_types=[GRPOConfig, ValueFunctionConfig])
     parser.add_argument("--expe_name", type=str, required=True, help="names the wandb run and its output_dir")
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="Qwen/Qwen2.5-0.5B-Instruct",
+        help="policy to train; the critic backbone is a copy of it, e.g. `--model_name allenai/Olmo-3-7B-Think`",
+    )
     parser.set_defaults(**DEFAULTS)
     config, value_function_config, script_args = parser.parse_args_and_config()
 
@@ -41,10 +48,11 @@ def main():
     dataset = load_dataset("trl-lib/DeepMath-103K", split="train")
 
     trainer = GRPOTrainer(
-        model="Qwen/Qwen2.5-0.5B-Instruct",
+        model=script_args.model_name,
         reward_funcs=accuracy_reward,
         train_dataset=dataset,
         args=config,
+        processing_class=AutoProcessor.from_pretrained(script_args.model_name, fix_mistral_regex=True),
         value_function_config=value_function_config,
     )
     trainer.train()

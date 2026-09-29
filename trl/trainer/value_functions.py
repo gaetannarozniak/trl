@@ -81,8 +81,9 @@ class ValueFunction:
             conversation=conversation, add_generation_prompt=True, tokenize=True, return_dict=True
         )["input_ids"]
         ids = [torch.tensor(i) for i in ids]
+        tokenizer = getattr(processing_class, "tokenizer", processing_class)  # a VLM processor wraps one
         return {
-            "critic_prompt_ids": pad(ids, padding_value=processing_class.pad_token_id, padding_side="left"),
+            "critic_prompt_ids": pad(ids, padding_value=tokenizer.pad_token_id, padding_side="left"),
             "critic_prompt_mask": pad([torch.ones_like(i) for i in ids], padding_value=0, padding_side="left"),
         }
 
@@ -195,7 +196,7 @@ class ValueFunction:
         return analyses
 
     def get_critic(self, policy_net: PreTrainedModel) -> nn.ModuleDict:
-        head_in = policy_net.config.hidden_size
+        head_in = policy_net.config.get_text_config().hidden_size
         backbone = copy.deepcopy(policy_net.base_model)
         if self.args.critic_layer is not None:
             if not 1 <= self.args.critic_layer <= len(backbone.layers):
