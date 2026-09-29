@@ -1,7 +1,6 @@
 import os
 
 from datasets import load_dataset
-from transformers import AutoProcessor
 
 from trl import GRPOConfig, GRPOTrainer, TrlParser
 from trl.rewards import accuracy_reward
@@ -52,7 +51,6 @@ def main():
         reward_funcs=accuracy_reward,
         train_dataset=dataset,
         args=config,
-        processing_class=AutoProcessor.from_pretrained(script_args.model_name, fix_mistral_regex=True),
         value_function_config=value_function_config,
     )
     trainer.train()
