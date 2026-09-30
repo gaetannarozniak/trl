@@ -36,6 +36,7 @@ class ValueFunctionConfig:
     target: str = (
         "residual"  # "residual" for R - Rloo, "plain" for R, "grpo" for linear interpolation between Rloo and R
     )
+    example_proof: bool = False  # show the critic the dataset's own worked solution, through `{example_proof}`
     analysis_model: str | None = None  # frozen model that reviews a group's rollouts into `{analysis}`
     analysis_max_tokens: int = 4096
     analysis_gpu_memory_utilization: float = 0.05  # ~14 GiB, against ~4 actually needed
@@ -44,6 +45,8 @@ class ValueFunctionConfig:
     def __post_init__(self):
         if self.yes_no_tokens_as_value and self.probe_token is None:
             raise ValueError("yes_no_tokens_as_value requires probe_token")
+        if self.example_proof and (self.privileged_template is None or "{example_proof}" not in self.privileged_template):
+            raise ValueError("example_proof requires `{example_proof}` in privileged_template")
         if self.analysis_model is None:
             return
         if not self.value_loss_skip_unanimous:

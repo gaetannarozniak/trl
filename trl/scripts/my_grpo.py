@@ -74,10 +74,15 @@ def main():
     # Problem 75468 of the train set is quite hard (1/16 correct answers for Qwen2.5-0.5B) and can be used for the only one problem overfitting configuration
     dataset = load_dataset(script_args.dataset, split="train")
     if "prompt" not in dataset.column_names:
-        dataset = dataset.map(
-            lambda row: {"prompt": [{"role": "user", "content": row["problem"]}], "solution": f"${row['answer']}$"},
-            remove_columns=dataset.column_names,
-        )
+
+        def to_trl_format(row):
+            mapped = {"prompt": [{"role": "user", "content": row["problem"]}], "solution": f"${row['answer']}$"}
+            if value_function_config.example_proof:
+                # extra_inputs formats the privileged template with the row, so any column is a template field
+                mapped["example_proof"] = row["solutions"][0]
+            return mapped
+
+        dataset = dataset.map(to_trl_format, remove_columns=dataset.column_names)
     if script_args.overfit_sample is not None:
         dataset = dataset.select([script_args.overfit_sample] * 100000)
 
