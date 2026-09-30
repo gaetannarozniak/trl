@@ -4,6 +4,9 @@
 #SBATCH --qos=g3_scientific-reasoning_high
 #SBATCH --account=scientific-reasoning
 #SBATCH --nodes=1
+# One node unless the submitter asks for more: `sbatch --nodes=N` overrides the directive above, and
+# everything below sizes itself from SLURM_NNODES. Twice the nodes is twice the generation batch at the same
+# work per rank, since generation_batch_size = per_device x num_processes x steps_per_generation.
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-gpu=36
@@ -42,6 +45,19 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TRITON_CACHE_DIR=/tmp/triton-$USER-$SLURM_JOB_ID
 export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor-$USER-$SLURM_JOB_ID
 
-echo "job $SLURM_JOB_ID (${NAME:-unnamed}) on $(hostname) | gpus=$SLURM_GPUS_ON_NODE cpus=$SLURM_CPUS_ON_NODE"
+GPUS=4
+MASTER=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+PORT=$((29500 + SLURM_JOB_ID % 1000))   # two jobs on one node must not share a rendezvous port
 
-accelerate launch --num_processes 4 trl/scripts/my_grpo.py "$@"
+echo "job $SLURM_JOB_ID (${NAME:-unnamed}) on $SLURM_NNODES node(s), master $MASTER port $PORT | $((SLURM_NNODES * GPUS)) processes"
+
+# One accelerate per node, each owning that node's 4 GPUs. `machine_rank` has to expand inside the task, so
+# it is single-quoted here and evaluated by the remote shell; `_ "$@"` forwards the sweep's arguments.
+srun --ntasks="$SLURM_NNODES" --ntasks-per-node=1 bash -c '
+accelerate launch \
+    --num_machines '"$SLURM_NNODES"' \
+    --num_processes '"$((SLURM_NNODES * GPUS))"' \
+    --machine_rank $SLURM_PROCID \
+    --main_process_ip '"$MASTER"' \
+    --main_process_port '"$PORT"' \
+    trl/scripts/my_grpo.py "$@"' _ "$@"
