@@ -115,6 +115,9 @@ def main():
             if not name.startswith("critic."):
                 param.requires_grad_(False)
         trainer.add_callback(DropEmbeddingGradHook())
+        # Paired with --vllm_importance_sampling_correction False in the sweep: with it on, the ratio would
+        # be taken between these zeros and real logprobs.
+        trainer.skip_policy_logps = True
 
     trainer.train()
 

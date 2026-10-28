@@ -1074,6 +1074,7 @@ class GRPOTrainer(_BaseTrainer):
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
         self._current_train_step_time = 0.0
+        self.skip_policy_logps = False
         self.log_completions = args.log_completions
         self.log_multimodal = args.log_multimodal
         self.log_unique_prompts = args.log_unique_prompts
@@ -1489,6 +1490,12 @@ class GRPOTrainer(_BaseTrainer):
         image_position_ids=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Compute log-probs, (optionally) entropies, and (optionally) the MoE load-balancing aux loss."""
+        if self.skip_policy_logps:
+            # At learning_rate 0 these only feed a loss term whose gradient is discarded. Zeros make the
+            # importance ratio exactly 1 and save a forward over the batch. Only valid while
+            # vllm_importance_sampling_correction is off, otherwise the ratio is taken against real logps.
+            zeros = torch.zeros(input_ids.size(0), logits_to_keep, device=input_ids.device)
+            return zeros, zeros, None
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
