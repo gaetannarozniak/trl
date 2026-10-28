@@ -10,7 +10,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-gpu=36
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --output=/storage/home/gaetan/slurm-logs/%x-%j.out
 #SBATCH --error=/storage/home/gaetan/slurm-logs/%x-%j.out
 

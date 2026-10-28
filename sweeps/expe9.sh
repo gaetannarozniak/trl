@@ -25,7 +25,8 @@ n=0
 # NODES=<n> to change how many nodes each job gets. Two nodes doubles the generation batch to 128 completions
 # per step at unchanged work per rank, so it buys throughput rather than a shorter step.
 NODES=${NODES:-2}
-sub() { n=$((n+1)); [ $n -gt 1 ] && ${DRY:+echo }sleep "$DELAY"; ${DRY:+echo }sbatch --qos="${QOS:-g3_core_shared}" --nodes="$NODES" my_grpo.sbatch "$@"; }
+# ONLY=<glob> submits only the matching arms, e.g. ONLY='9.1[01]_*'. [[ ]] not case: names contain `|`.
+sub() { [[ "$2" == ${ONLY:-*} ]] || return 0; n=$((n+1)); [ $n -gt 1 ] && ${DRY:+echo }sleep "$DELAY"; ${DRY:+echo }sbatch --qos="${QOS:-g3_core_shared}" --nodes="$NODES" my_grpo.sbatch "$@"; }
 
 # 9.x reproduces experiment x of expe_0_to_3 .. expe7 on this model. The probe variants of expe 3 and 3.1 are
 # absent on purpose: _probe_hidden interleaves a probe after every completion token and builds a dense
@@ -58,5 +59,8 @@ for s in 1 2; do
   run "9.7_plr0|residual|aime|privileged|overfit1044|qwen3|s$s"     $s --privileged_template "$TPL_SHORT" --overfit_sample 1044 --dataset "$DS_FULL"
   run "9.7_plr0|residual|aime|privileged|overfit1054|qwen3|s$s"     $s --privileged_template "$TPL_SHORT" --overfit_sample 1054 --dataset "$DS_FULL"
   run "9.8_plr0|residual|aime|privileged|proof|qwen3|s$s"           $s --privileged_template "$TPL_PROOF" --example_proof True
-  run "9.8_plr0|residual|aime|privileged|proof|skipunanimous|qwen3|s$s" $s --privileged_template "$TPL_PROOF" --example_proof True --value_loss_skip_unanimous True
+  # Only the value head trains, on a frozen backbone: a linear probe on the policy's own representation.
+  run "9.9_plr0|residual|aime|privileged|headonly|qwen3|s$s"        $s --privileged_template "$TPL_SHORT" --critic_head_only True
+  # 9.3 never separated from 9.0 because bfloat16 rounds the critic's 1e-5 Adam step away: take a larger step.
+  run "9.11_plr0|residual|aime|privileged|clr1e-4|qwen3|s$s"        $s --privileged_template "$TPL_SHORT" --critic_lr 1e-4
 done

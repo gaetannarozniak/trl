@@ -32,6 +32,7 @@ DEFAULTS = {
     "max_completion_length": 2048,
     "num_generations": 16,
     "scale_rewards": "none",
+    "num_train_epochs": 20,
 }
 
 
@@ -64,6 +65,12 @@ def main():
         default=None,
         help="train on this single dataset row only, e.g. `--overfit_sample 75468`, to test overfitting",
     )
+    parser.add_argument(
+        "--eos_token",
+        type=str,
+        default=None,
+        help="override the tokenizer's eos, e.g. `--eos_token '<|im_end|>'` for a base model prompted in ChatML",
+    )
     parser.set_defaults(**DEFAULTS)
     config, value_function_config, script_args = parser.parse_args_and_config()
 
@@ -86,16 +93,18 @@ def main():
     if script_args.overfit_sample is not None:
         dataset = dataset.select([script_args.overfit_sample] * 100000)
 
+    # A multimodal checkpoint would otherwise get an AutoProcessor, whose batched
+    # apply_chat_template cannot stack prompts of different lengths.
+    tokenizer = AutoTokenizer.from_pretrained(script_args.model_name, truncation_side="left", padding_side="left")
+    if script_args.eos_token is not None:
+        tokenizer.eos_token = script_args.eos_token
+
     trainer = GRPOTrainer(
         model=script_args.model_name,
         reward_funcs=accuracy_reward,
         train_dataset=dataset,
         args=config,
-        # A multimodal checkpoint would otherwise get an AutoProcessor, whose batched
-        # apply_chat_template cannot stack prompts of different lengths.
-        processing_class=AutoTokenizer.from_pretrained(
-            script_args.model_name, truncation_side="left", padding_side="left"
-        ),
+        processing_class=tokenizer,
         value_function_config=value_function_config,
     )
 
