@@ -1,6 +1,7 @@
 import collections
 import copy
 import time
+import traceback
 from dataclasses import dataclass
 from html import escape
 
@@ -36,6 +37,7 @@ class ValueFunctionConfig:
     target: str = (
         "residual"  # "residual" for R - Rloo, "plain" for R, "grpo" for linear interpolation between Rloo and R
     )
+    critic_head_only: bool = False  # train the value head alone, on top of a frozen backbone
     example_proof: bool = False  # show the critic the dataset's own worked solution, through `{example_proof}`
     analysis_model: str | None = None  # frozen model that reviews a group's rollouts into `{analysis}`
     analysis_max_tokens: int = 4096
@@ -60,7 +62,8 @@ class ValueFunctionConfig:
 class ValueFunction:
     def __init__(self, args: ValueFunctionConfig):
         self.args = args
-        self._last_plot_step = -1
+        self._pending_step = None
+        self._eval_failed = False
         self._processing_class = None
         self._logged_privileged = False
         self._probe_id = None
@@ -252,6 +255,10 @@ class ValueFunction:
             nn.init.zeros_(critic["head"][-2].weight)
             nn.init.zeros_(critic["head"][-2].bias)
         critic["head"].requires_grad_(not self.args.yes_no_tokens_as_value)
+        # A frozen backbone has no parameter requiring grad, so its forward builds no graph at all: the head
+        # becomes a linear probe on the policy's own representation, and the critic costs one forward.
+        backbone.requires_grad_(not self.args.critic_head_only)
+        self._critic = critic  # kept so the reference eval can call get_values outside the loss
         # Shared with the policy, not a copy: no extra memory or state_dict entry, and it tracks the policy's
         # device. Deliberately not frozen: freezing would freeze the policy's own lm_head.
         self._policy_head = policy_net.get_output_embeddings()
@@ -426,6 +433,29 @@ class ValueFunction:
         return ((values[:, :-1] - target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
 
     @torch.no_grad()
+    def log_reference_eval(self, accelerator, metrics, inputs, values, step, every=10):
+        """Score the critic against the Monte-Carlo curves of ../value_estimation, every `every` steps.
+
+        Runs on the main process only: the traces are fixed, so every rank would compute the same numbers.
+        `selfcheck` is reported alongside because a correlation against a curve is only worth reading once
+        the eval is known to build the critic's input the way training does.
+        """
+        if step % every or not accelerator.is_main_process or self._eval_failed:
+            return
+        from .value_function_eval import evaluate, selfcheck
+
+        # A diagnostic must never take the run with it: report the first failure in full, then stay out of
+        # the way for the rest of the run rather than raising the same thing every tenth step.
+        try:
+            metrics["eval/selfcheck_maxdiff"].append(selfcheck(self, self._critic, inputs, values))
+            scores, html = evaluate(self, self._critic, values.device, step)
+            for key, value in scores.items():
+                metrics[key].append(value)
+            wandb.log({"eval/value_curves": wandb.Html(html, inject=False)})
+        except Exception:
+            self._eval_failed = True
+            print(f"reference eval disabled for the rest of the run:\n{traceback.format_exc()}", flush=True)
+
     def log_privileged_example(self, accelerator, inputs):
         """Log one critic prompt and its generation, once, to eyeball that the privileged text is wired right."""
         if self._logged_privileged or "critic_prompt_ids" not in inputs:
@@ -475,18 +505,24 @@ class ValueFunction:
     def log_advantage_plot(self, accelerator, inputs, advantages, step, every=10):
         """Log an HTML chart of the cumulative advantage along the completions of one prompt.
 
-        A group's `num_generations` rollouts are shuffled across the micro-batches of one optimizer step, so
-        each call contributes the few rows it holds and the chart is emitted once a group is whole. The group
-        is picked among those holding both a correct and an incorrect rollout, since the point is to compare
-        how credit is spread in either case. Blue is a correct rollout, vermillion an incorrect one
-        (Okabe-Ito, which stays separable under colour-vision deficiency). Emitted as inline SVG rather than
-        through a plotting library, so it needs no dependency beyond wandb, and logged without an explicit
-        `step=`: wandb's own counter runs ahead of `global_step` and anything below it is silently discarded.
+        A group's rollouts are shuffled across the micro-batches of one optimizer step, and a rank holds only
+        `generation_batch_size / num_processes` of them - a whole group when that is at least
+        `num_generations`, otherwise a slice of one. So the rollouts are accumulated by prompt and the chart
+        is drawn for whatever the rank ended up with, at the first call of the next step. The group is picked
+        among those holding both a correct and an incorrect rollout, since the point is to compare how credit
+        is spread in either case. Blue is a correct rollout, vermillion an incorrect one (Okabe-Ito, which
+        stays separable under colour-vision deficiency). Emitted as inline SVG rather than through a plotting
+        library, so it needs no dependency beyond wandb, and logged without an explicit `step=`: wandb's own
+        counter runs ahead of `global_step` and anything below it is silently discarded.
         """
-        if step % every or step == self._last_plot_step:
-            return
         if not (accelerator.is_main_process and is_wandb_available() and wandb.run is not None):
             return
+        if self._pending_curves and step != self._pending_step:
+            self._emit_advantage_plot(self._pending_curves, self._pending_step)
+            self._pending_curves = {}
+        if step % every:
+            return
+        self._pending_step = step
 
         mask = inputs["completion_mask"]
         correct = inputs["rewards"] > 0
@@ -507,13 +543,11 @@ class ValueFunction:
                     "cum": cumulative.tolist(),
                 }
             )
-        whole = [rollouts for rollouts in self._pending_curves.values() if len(rollouts) >= self._num_generations]
-        if not whole:
-            return
-        mixed = [rollouts for rollouts in whole if 0 < sum(r["ok"] for r in rollouts) < len(rollouts)]
-        group = (mixed or whole)[0]
-        self._last_plot_step = step
-        self._pending_curves.clear()
+    def _emit_advantage_plot(self, pending, step):
+        """Draw the fullest group the rank collected, preferring one that holds both outcomes."""
+        groups = sorted(pending.values(), key=len, reverse=True)
+        mixed = [g for g in groups if 0 < sum(r["ok"] for r in g) < len(g)]
+        group = (mixed or groups)[0]
 
         curves = []
         for r in group:
@@ -561,7 +595,8 @@ class ValueFunction:
             )
         mid = (top + height - bottom) / 2
         svg.append(
-            f'<text x="{left}" y="18" font-size="13" fill="#111827">step {step} - {len(curves)} generations - '
+            f'<text x="{left}" y="18" font-size="13" fill="#111827">step {step} - {len(curves)} of '
+            f'{self._num_generations} generations (this rank) - '
             f'mean reward {sum(r["reward"] for r in group) / len(group):.2f}</text>'
         )
         svg.append(
@@ -656,18 +691,34 @@ class ValueFunction:
         # nothing to the signal while still charging their error to the residual, which only drags the ratio down.
         rewards = inputs["rewards"].unsqueeze(-1)
         centered = rewards - inputs["rloo_baseline"].unsqueeze(-1)
-        mask = inputs["completion_mask"] * (centered.abs() > 1e-8)
-        residual = ((values[:, :-1].detach() - rewards) ** 2 * mask).sum()
-        signal = (centered**2 * mask).sum()
-        residual, signal = accelerator.gather(residual).sum(), accelerator.gather(signal).sum()
-        if signal > 0:  # every group unanimous: the baseline already is the reward, so there is nothing to explain
-            metrics["value_ev"].append((1.0 - residual / signal).item())
+        scored = inputs["completion_mask"] * (centered.abs() > 1e-8)
+
+        def explained_variance(mask):
+            residual = ((values[:, :-1].detach() - rewards) ** 2 * mask).sum()
+            signal = (centered**2 * mask).sum()
+            residual, signal = accelerator.gather(residual).sum(), accelerator.gather(signal).sum()
+            # every group unanimous: the baseline already is the reward, so there is nothing to explain
+            return (1.0 - residual / signal).item() if signal > 0 else None
+
+        # Same test as completions/clipped_ratio: a rollout whose last token is neither eos nor pad ran into
+        # the length cap. It scores 0 for want of an answer rather than for its reasoning, so the critic is
+        # charged with an error the trace gives it no way to predict; without them the ratio is comparable
+        # across completion caps.
+        last = inputs["completion_ids"].gather(
+            1, (inputs["completion_mask"].sum(1).long() - 1).clamp(min=0).unsqueeze(1)
+        ).squeeze(1)
+        terminated = (last == self._processing_class.eos_token_id) | (last == self._processing_class.pad_token_id)
+        for name, mask in (("value_ev", scored), ("value_ev_nontruncated", scored * terminated.unsqueeze(-1))):
+            value = explained_variance(mask)  # called on every rank: it gathers
+            if value is not None:
+                metrics[name].append(value)
 
         for key, value in self._analysis_stats.items():
             metrics[key].append(value)
         for key, value in self._times.items():
             metrics[key].append(value)
         self._times.clear()
+        self.log_reference_eval(accelerator, metrics, inputs, values, step)
         self.log_privileged_example(accelerator, inputs)
         self.log_analysis_example(accelerator)
         self.log_advantage_plot(accelerator, inputs, advantages, step)
