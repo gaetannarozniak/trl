@@ -11,13 +11,14 @@ class ValueMC:
         self.eval_interval: int = args.eval_interval
         self.n_samples_mc = args.n_samples_mc
         self.max_model_len = args.max_model_len
+        self.max_completion_length = args.max_completion_length
         self.prompts = prompts
         self.ground_truths = ground_truths
         self.vllm_policy = LLM(model=args.model_id, max_model_len=self.max_model_len)
 
     def generate_trajs_to_eval(self) -> list[RequestOutput]:
         return self.vllm_policy.generate(
-            prompts=self.prompts, sampling_params=SamplingParams(max_tokens=self.max_model_len)
+            prompts=self.prompts, sampling_params=SamplingParams(max_tokens=self.max_completion_length)
         )
 
     def generate_prefixes(self, outputs: list[RequestOutput]) -> tuple[list[list[int]], list[tuple[int, int]]]:
@@ -33,9 +34,12 @@ class ValueMC:
         return prefixes, traj_mapping
 
     def eval_prefixes(self, prefixes: list[list[int]], traj_mapping: list[tuple[int, int]]) -> list[list[float]]:
-        mc_outputs = self.vllm_policy.generate(
-            prompts=prefixes, sampling_params=SamplingParams(n=self.n_samples_mc, max_tokens=self.max_model_len)
-        )
+        # Prefix k already holds k * eval_interval completion tokens, so cap the total at max_completion_length
+        sampling_params = [
+            SamplingParams(n=self.n_samples_mc, max_tokens=self.max_completion_length - k * self.eval_interval)
+            for _, k in traj_mapping
+        ]
+        mc_outputs = self.vllm_policy.generate(prompts=prefixes, sampling_params=sampling_params)
         tokenizer = self.vllm_policy.get_tokenizer()
 
         rewards = [[] for _ in range(len(self.prompts))]
@@ -80,6 +84,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_id", required=True)
     parser.add_argument("--eval_interval", type=int, required=True)
     parser.add_argument("--max_model_len", type=int, required=True)
+    parser.add_argument("--max_completion_length", type=int, required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--max_prompts", type=int, default=None)
 
