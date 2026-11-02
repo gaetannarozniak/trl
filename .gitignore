@@ -146,3 +146,7 @@ uv.lock
 # AI agent generated artifacts
 /.claude/skills
 /.agents/skills/local-*/
+
+# MC value estimation logs and results
+logs/
+mc_value_results/

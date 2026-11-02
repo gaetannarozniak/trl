@@ -3,7 +3,7 @@ import json
 import datasets
 from vllm import LLM, RequestOutput, SamplingParams
 
-from trl.trainer.reward_function import reward_function
+from trl.value_function.reward_function import reward_function
 
 
 class ValueMC:
@@ -36,14 +36,18 @@ class ValueMC:
         mc_outputs = self.vllm_policy.generate(
             prompts=prefixes, sampling_params=SamplingParams(n=self.n_samples_mc, max_tokens=self.max_model_len)
         )
+        tokenizer = self.vllm_policy.get_tokenizer()
 
         rewards = [[] for _ in range(len(self.prompts))]
         for i, mc_output in enumerate(mc_outputs):
             rewards[traj_mapping[i][0]].append([])
             mean_reward = 0.0
             ground_truth = self.ground_truths[traj_mapping[i][0]]
+            prefix_text = tokenizer.decode(prefixes[i])
             for n in range(self.n_samples_mc):
-                mean_reward += reward_function(mc_output.outputs[n].text, ground_truth) / self.n_samples_mc
+                mean_reward += (
+                    reward_function(prefix_text + mc_output.outputs[n].text, ground_truth) / self.n_samples_mc
+                )
             rewards[traj_mapping[i][0]][traj_mapping[i][1]] = mean_reward
 
         return rewards
@@ -70,7 +74,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_name", required=True)
-    parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument("--shard_count", type=int, default=1)
+    parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--n_samples_mc", type=int, required=True)
     parser.add_argument("--model_id", required=True)
     parser.add_argument("--eval_interval", type=int, required=True)
@@ -83,9 +88,9 @@ if __name__ == "__main__":
     dataset = datasets.load_dataset(args.dataset_name, split="train").shuffle(seed=0)
     if args.max_prompts is not None:
         dataset = dataset.select(range(args.max_prompts))
-    prompts: list[str] = [dataset["prompt"][i][0]["content"] for i in range(0, len(dataset), args.stride)]
-    ground_truths: list[str] = [dataset["label"][i] for i in range(0, len(dataset), args.stride)]
-
+    dataset = dataset.shard(num_shards=args.shard_count, index=args.shard_index, contiguous=False)
+    prompts = [row[0]["content"] for row in dataset["prompt"]]
+    ground_truths = dataset["label"]
     value_mc = ValueMC(prompts, ground_truths, args)
     outputs = value_mc.generate_trajs_to_eval()
     prefixes, traj_mapping = value_mc.generate_prefixes(outputs)
