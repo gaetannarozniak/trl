@@ -39,7 +39,9 @@ class ValueMC:
             SamplingParams(n=self.n_samples_mc, max_tokens=self.max_completion_length - k * self.eval_interval)
             for _, k in traj_mapping
         ]
-        mc_outputs = self.vllm_policy.generate(prompts=prefixes, sampling_params=sampling_params)
+        mc_outputs = self.vllm_policy.generate(
+            prompts=[{"prompt_token_ids": prefix} for prefix in prefixes], sampling_params=sampling_params
+        )
         tokenizer = self.vllm_policy.get_tokenizer()
 
         rewards = [[] for _ in range(len(self.prompts))]
@@ -47,7 +49,8 @@ class ValueMC:
             rewards[traj_mapping[i][0]].append([])
             mean_reward = 0.0
             ground_truth = self.ground_truths[traj_mapping[i][0]]
-            prefix_text = tokenizer.decode(prefixes[i])
+            completion_start = len(prefixes[i]) - traj_mapping[i][1] * self.eval_interval
+            prefix_text = tokenizer.decode(prefixes[i][completion_start:], skip_special_tokens=True)
             for n in range(self.n_samples_mc):
                 mean_reward += (
                     reward_function(prefix_text + mc_output.outputs[n].text, ground_truth) / self.n_samples_mc
@@ -67,6 +70,7 @@ class ValueMC:
                             "completion_token_ids": traj.outputs[0].token_ids,
                             "completion_string": traj.outputs[0].text,
                             "values": value,
+                            "max_completion_length": self.max_completion_length,
                         }
                     )
                     + "\n"
