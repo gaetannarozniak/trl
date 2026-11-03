@@ -322,6 +322,7 @@ class GRPOTrainer(_BaseTrainer):
         tools: list[Callable] | None = None,
         rollout_func: RolloutFunc | None = None,
         environment_factory: EnvironmentFactory | dict[str, EnvironmentFactory] | None = None,
+        value_function=None,
     ):
         # Args
         if args is None:
@@ -610,6 +611,7 @@ class GRPOTrainer(_BaseTrainer):
             else:
                 self.reward_func_names.append(get_callable_name(reward_funcs[i]))
         self.reward_funcs = reward_funcs
+        self.value_function = value_function
 
         # Reward weights
         if args.reward_weights is not None:
@@ -2948,6 +2950,7 @@ class GRPOTrainer(_BaseTrainer):
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
             "advantages": advantages,
+            "rewards": rewards[process_slice],
             "num_items_in_batch": num_items_in_batch,
         }
         if old_per_token_logps is not None:
@@ -3334,6 +3337,8 @@ class GRPOTrainer(_BaseTrainer):
         elif self.loss_type == "vespo":
             self._metrics[mode]["vespo/phi_seq_mean"].append(global_masked_mean(phi_seq))
 
+        if self.value_function is not None:
+            loss = loss + self.value_function.compute_loss(self, inputs)
         return loss
 
     # During eval, Trainer calls prediction_step. If no labels are present in the inputs, it only runs forward and
