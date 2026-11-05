@@ -11,4 +11,4 @@ sbatch --nodes=8 --job-name=4_value_ckpt300_mc1_8nodes_intermediate_credit_repla
     --policy_model_name_or_path $CKPT --value_model_name_or_path $CKPT \
     --value_mc_path mc_value_results/mc1_256trajs_128samples/all.jsonl --eval_on_start true --eval_steps 5 \
     --per_device_eval_batch_size 8 --eval_steps 20 --value_mc_targets_every 128 --value_mc_targets_samples 4 \
-    --value_replay_updates 4 --value_replay_buffer_steps 4
+    --value_replay_updates 8 --value_replay_buffer_steps 64
