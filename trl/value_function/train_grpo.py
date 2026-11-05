@@ -27,7 +27,7 @@ if __name__ == "__main__":
         use_adaptive_entropy=True,
         entropy_target=0.3,
         logging_steps=1,
-        log_completions=True,
+        log_completions=False,
         num_completions_to_print=1,
         eval_strategy="steps",
         eval_steps=25,
