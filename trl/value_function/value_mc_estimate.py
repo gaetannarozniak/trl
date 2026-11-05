@@ -1,4 +1,5 @@
 import json
+import os
 
 import datasets
 from vllm import LLM, RequestOutput, SamplingParams
@@ -8,6 +9,7 @@ from trl.value_function.reward_function import reward_function
 
 class ValueMC:
     def __init__(self, prompts: list[str], ground_truths: list[str], args):
+        self.model_id = args.model_id
         self.eval_interval: int = args.eval_interval
         self.n_samples_mc = args.n_samples_mc
         self.max_model_len = args.max_model_len
@@ -47,19 +49,30 @@ class ValueMC:
         rewards = [[] for _ in range(len(self.prompts))]
         for i, mc_output in enumerate(mc_outputs):
             rewards[traj_mapping[i][0]].append([])
-            mean_reward = 0.0
             ground_truth = self.ground_truths[traj_mapping[i][0]]
             completion_start = len(prefixes[i]) - traj_mapping[i][1] * self.eval_interval
             prefix_text = tokenizer.decode(prefixes[i][completion_start:], skip_special_tokens=True)
-            for n in range(self.n_samples_mc):
-                mean_reward += (
-                    reward_function(prefix_text + mc_output.outputs[n].text, ground_truth) / self.n_samples_mc
-                )
+            # Sum then divide, so that always/never solved prefixes are exactly 1.0/0.0
+            mean_reward = (
+                sum(reward_function(prefix_text + output.text, ground_truth) for output in mc_output.outputs)
+                / self.n_samples_mc
+            )
             rewards[traj_mapping[i][0]][traj_mapping[i][1]] = mean_reward
 
         return rewards
 
     def dump(self, evaluated_trajs, values, file_path):
+        sampling_params = SamplingParams()
+        mc_args = {
+            "model_id": os.path.realpath(self.model_id) if os.path.isdir(self.model_id) else self.model_id,
+            "eval_interval": self.eval_interval,
+            "max_completion_length": self.max_completion_length,
+            "temperature": sampling_params.temperature,
+            "top_p": sampling_params.top_p,
+            "top_k": sampling_params.top_k,
+            "min_p": sampling_params.min_p,
+            "repetition_penalty": sampling_params.repetition_penalty,
+        }
         with open(file_path, "w") as f:
             for prompt, gt, traj, value in zip(self.prompts, self.ground_truths, evaluated_trajs, values, strict=True):
                 f.write(
@@ -67,10 +80,11 @@ class ValueMC:
                         {
                             "prompt": prompt,
                             "ground_truth": gt,
+                            "prompt_token_ids": traj.prompt_token_ids,
                             "completion_token_ids": traj.outputs[0].token_ids,
                             "completion_string": traj.outputs[0].text,
                             "values": value,
-                            "max_completion_length": self.max_completion_length,
+                            "mc_args": mc_args,
                         }
                     )
                     + "\n"

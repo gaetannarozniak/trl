@@ -32,20 +32,19 @@ if __name__ == "__main__":
         learning_rate=0.0,
         gradient_checkpointing=False,
         lr_scheduler_type="constant",
-        num_train_epochs=10,
+        num_train_epochs=100,
         per_device_train_batch_size=8,
         gradient_accumulation_steps=16,
         max_completion_length=2048,
         logging_steps=1,
-        log_completions=True,
+        log_completions=False,
         num_completions_to_print=1,
         eval_strategy="steps",
-        eval_steps=25,
-        eval_on_start=False,
-        per_device_eval_batch_size=32,
+        eval_steps=10,
+        eval_on_start=True,
+        per_device_eval_batch_size=16,
         num_generations_eval=1,
-        save_steps=50000,
-        save_only_model=True,
+        save_strategy="no",
     )
     training_args, value_args = parser.parse_args_and_config()
     training_args.output_dir = os.path.join(training_args.output_dir, training_args.run_name)
@@ -56,7 +55,13 @@ if __name__ == "__main__":
     eval_dataset = dataset.select(range(256))
     train_dataset = dataset.select(range(256, len(dataset)))
 
-    value_function = ValueFunction(value_args)
+    value_function = ValueFunction(value_args, training_args, eval_dataset["prompt"])
+    if value_args.value_num_train_problems is not None:
+        # Train on the problems of the MC trajectories of the angle, repeated since GRPO only samples full batches
+        rows = value_function.mc_rows
+        train_dataset = datasets.Dataset.from_dict(
+            {"prompt": [row["prompt"] for row in rows], "label": [row["ground_truth"] for row in rows]}
+        ).repeat(len(train_dataset) // len(rows))
     trainer = GRPOTrainer(
         model=value_args.policy_model_name_or_path,
         reward_funcs=accuracy_reward,
