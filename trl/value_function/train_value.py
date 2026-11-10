@@ -13,7 +13,7 @@ import datasets
 
 from trl import GRPOConfig, GRPOTrainer, TrlParser
 from trl.value_function.reward_function import reward_function
-from trl.value_function.value_function import ValueConfig, ValueFunction
+from trl.value_function.value_function import HELDOUT_PROBLEMS, ValueConfig, ValueFunction
 
 
 def accuracy_reward(completions: list[str], label: list[str], **kwargs) -> list[float]:
@@ -49,19 +49,19 @@ if __name__ == "__main__":
     training_args, value_args = parser.parse_args_and_config()
     training_args.output_dir = os.path.join(training_args.output_dir, training_args.run_name)
 
-    # Same shuffle as value_mc_estimate.py, so its first `--max_prompts` (<= 256) prompts are the eval split
+    # Same shuffle as value_mc_estimate.py, so the MC problems of index < HELDOUT_PROBLEMS are the eval split
     dataset = datasets.load_dataset("zhuzilin/dapo-math-17k", split="train").shuffle(seed=0)
     dataset = dataset.map(lambda example: {"prompt": example["prompt"][0]["content"]})
-    eval_dataset = dataset.select(range(256))
-    train_dataset = dataset.select(range(256, len(dataset)))
+    eval_dataset = dataset.select(range(HELDOUT_PROBLEMS))
+    train_dataset = dataset.select(range(HELDOUT_PROBLEMS, len(dataset)))
 
-    value_function = ValueFunction(value_args, training_args, eval_dataset["prompt"])
+    value_function = ValueFunction(value_args, training_args)
     if value_args.value_num_train_problems is not None:
-        # Train on the problems of the MC trajectories of the angle, repeated since GRPO only samples full batches
-        rows = value_function.mc_rows
+        # Train on the problems of the training MC trajectories, repeated since GRPO only samples full batches
+        problems = list({row["index"]: row for row in value_function.splits["train"]}.values())
         train_dataset = datasets.Dataset.from_dict(
-            {"prompt": [row["prompt"] for row in rows], "label": [row["ground_truth"] for row in rows]}
-        ).repeat(len(train_dataset) // len(rows))
+            {"prompt": [row["prompt"] for row in problems], "label": [row["ground_truth"] for row in problems]}
+        ).repeat(len(train_dataset) // len(problems))
     trainer = GRPOTrainer(
         model=value_args.policy_model_name_or_path,
         reward_funcs=accuracy_reward,

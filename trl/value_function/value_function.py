@@ -1,5 +1,6 @@
 import json
 import os
+import random
 from dataclasses import dataclass, field
 
 import matplotlib.pyplot as plt
@@ -7,6 +8,10 @@ import torch
 import wandb
 from accelerate import PartialState
 from transformers import AutoModelForTokenClassification, TrainerCallback
+
+
+HELDOUT_PROBLEMS = 128  # first problems of the shuffled dataset, never trained on
+POOL_PROBLEMS = 1024  # eligible problems after the held-out ones, among which the training problems are drawn
 
 
 @dataclass
@@ -23,24 +28,24 @@ class ValueConfig:
     value_num_train_problems: int | None = field(
         default=None,
         metadata={
-            "help": "If set, train only on the problems of the first N MC trajectories that pass the filters, which are "
-            "also the ones used for the angle and the plot."
+            "help": "If set, train only on N problems drawn with `--seed` among the first 1024 problems of the MC "
+            "estimates after the 128 held-out ones, and also log the angle on their MC trajectories."
         },
     )
     value_mc_path: str | None = field(
         default=None,
         metadata={
             "help": "`.jsonl` from value_mc_estimate.py. If set, the angle between the MC and the value function "
-            "advantages is logged at each evaluation."
+            "advantages is logged at each evaluation, on the held-out problems and on the training problems."
         },
     )
 
 
-def load_mc_estimates(path, args, config, eval_prompts):
+def load_mc_estimates(path, args, config):
     with open(path) as f:
         rows = [json.loads(line) for line in f]
-    if "mc_args" not in rows[0]:
-        raise ValueError(f"{path} was produced by an older value_mc_estimate.py without `mc_args`, rerun it.")
+    if "index" not in rows[0]:
+        raise ValueError(f"{path} was produced by an older value_mc_estimate.py without problem indices, rerun it.")
     mc_args = rows[0]["mc_args"]
     policy = config.policy_model_name_or_path
     expected = {
@@ -57,24 +62,35 @@ def load_mc_estimates(path, args, config, eval_prompts):
         for key, value in expected.items()
         if mc_args[key] != value
     ]
-    eval_prompts = set(eval_prompts)
-    num_outside = sum(row["prompt"] not in eval_prompts for row in rows)
-    if num_outside:
-        errors.append(
-            f"  {num_outside} of {len(rows)} MC prompts are not in the eval split, the value model may train on them"
-        )
-    # Skip almost always/never solved prompts, and flat MC values for which the angle is undefined
-    rows = [row for row in rows if 0.1 <= row["values"][0] <= 0.9 and len(set(row["values"])) > 1]
+    # Flat MC values have no advantages, so no angle
+    rows = [row for row in rows if len(set(row["values"])) > 1]
+    pool = sorted({row["index"] for row in rows if row["index"] >= HELDOUT_PROBLEMS})[:POOL_PROBLEMS]
     num_problems = config.value_num_train_problems
-    if num_problems is not None and num_problems > len(rows):
-        errors.append(
-            f"  value_num_train_problems is {num_problems}, but only {len(rows)} MC trajectories pass the filters"
-        )
+    if num_problems is not None and num_problems > len(pool):
+        errors.append(f"  value_num_train_problems is {num_problems}, but the MC estimates have {len(pool)} problems")
     if args.eval_strategy == "no":
         errors.append("  eval_strategy is 'no', so the MC metric would never be computed")
     if errors:
         raise ValueError(f"The MC estimates in {path} are incompatible with this run:\n" + "\n".join(errors))
-    return rows[:num_problems], mc_args["eval_interval"]
+    # A shuffle, so that for a given seed the problems of a smaller N are among those of a larger N
+    random.Random(args.seed).shuffle(pool)
+    train_problems = set(pool[:num_problems]) if num_problems is not None else set()
+    splits = {
+        "train": [row for row in rows if row["index"] in train_problems],
+        "heldout": [row for row in rows if row["index"] < HELDOUT_PROBLEMS],
+    }
+    splits = {name: [add_mc_advantages(row) for row in rows] for name, rows in splits.items() if rows}
+    return splits, mc_args["eval_interval"]
+
+
+def add_mc_advantages(row):
+    row["mc_advantages"] = torch.tensor(row["values"]).diff()
+    # REINFORCE's advantage R - V0 is the same for every token, with the sign of 2R - 1 since 0 < V0 < 1
+    reinforce_advantages = torch.full_like(row["mc_advantages"], 2 * row["reward"] - 1)
+    row["reinforce_cos"] = torch.nn.functional.cosine_similarity(
+        reinforce_advantages, row["mc_advantages"], dim=0
+    ).item()
+    return row
 
 
 class ValueFunction(TrainerCallback):
@@ -83,13 +99,13 @@ class ValueFunction(TrainerCallback):
     completion (no discount). Its loss is added to the GRPO loss, and it is stepped with its own optimizer.
     """
 
-    def __init__(self, config: ValueConfig, args, eval_prompts):
-        self.mc_rows = None
+    def __init__(self, config: ValueConfig, args):
+        self.splits = {}  # MC trajectories of the training and held-out problems
         self.mc_step = -1
         if config.value_num_train_problems is not None and config.value_mc_path is None:
             raise ValueError("`--value_num_train_problems` needs `--value_mc_path`, the problems are taken from it.")
         if config.value_mc_path is not None:
-            self.mc_rows, self.mc_eval_interval = load_mc_estimates(config.value_mc_path, args, config, eval_prompts)
+            self.splits, self.mc_eval_interval = load_mc_estimates(config.value_mc_path, args, config)
         self.model, loading_info = AutoModelForTokenClassification.from_pretrained(
             config.value_model_name_or_path, num_labels=1, dtype=torch.float32, output_loading_info=True
         )
@@ -118,11 +134,12 @@ class ValueFunction(TrainerCallback):
 
         mode = "train" if trainer.model.training else "eval"
         trainer._metrics[mode]["value_loss"].append(trainer.accelerator.gather(loss.detach()).mean().item())
-        if mode == "eval" and self.mc_rows is not None and trainer.state.global_step != self.mc_step:
+        if mode == "eval" and self.splits and trainer.state.global_step != self.mc_step:
             self.mc_step = trainer.state.global_step
-            angle, num_trajectories = self.mc_advantage_angle(trainer)
-            trainer._metrics[mode]["value/mc_advantage_angle"].append(angle)
-            trainer._metrics[mode]["value/mc_num_trajectories"].append(num_trajectories)
+            names = ("angle", "reinforce_angle", "num_problems")
+            for split, rows in self.splits.items():
+                for name, value in zip(names, self.mc_angles(trainer, rows), strict=True):
+                    trainer._metrics[mode][f"value/{split}_{name}"].append(value)
             if trainer.accelerator.is_main_process and wandb.run is not None:
                 self.log_mc_curves(trainer)
         return loss / (trainer.current_gradient_accumulation_steps if mode == "train" else 1)
@@ -136,22 +153,29 @@ class ValueFunction(TrainerCallback):
             logits = self.model(input_ids=input_ids).logits
         return logits[0, len(prompt_ids) - 1 : -1, 0].float()
 
-    def mc_advantage_angle(self, trainer):
-        # Mean over MC trajectories of the angle (degrees) between the MC and the value function advantages
+    def mc_angles(self, trainer, rows):
+        # Mean over problems of the mean over their trajectories of the angles (degrees) between the MC advantages and
+        # those of the value function, and of REINFORCE as a reference
         accelerator = trainer.accelerator
-        stats = torch.zeros(2, device=accelerator.device)  # sum of angles, number of trajectories
-        for row in self.mc_rows[accelerator.process_index :: accelerator.num_processes]:
+        problems = {index: position for position, index in enumerate(sorted({row["index"] for row in rows}))}
+        # Per problem, sums of the 2 angles and number of trajectories
+        stats = torch.zeros(len(problems), 3, device=accelerator.device)
+        for row in rows[accelerator.process_index :: accelerator.num_processes]:
             value_advantages = self.mc_values(trainer, row)[:: self.mc_eval_interval].diff()
-            mc_advantages = torch.tensor(row["values"], device=accelerator.device).diff()
+            mc_advantages = row["mc_advantages"].to(accelerator.device)
             cos = torch.nn.functional.cosine_similarity(value_advantages, mc_advantages, dim=0)
-            stats += torch.stack([torch.rad2deg(torch.arccos(cos.clamp(-1, 1))), torch.ones_like(cos)])
-        angle_sum, count = accelerator.reduce(stats, reduction="sum")
-        return (angle_sum / count).item(), count.item()
+            cosines = torch.stack([cos, cos.new_tensor(row["reinforce_cos"])])
+            stats[problems[row["index"]]] += torch.cat(
+                [torch.rad2deg(torch.arccos(cosines.clamp(-1, 1))), cos.new_ones(1)]
+            )
+        stats = accelerator.reduce(stats, reduction="sum")
+        return [*(stats[:, :2] / stats[:, 2:]).mean(0).tolist(), len(problems)]
 
     def log_mc_curves(self, trainer):
         # One image per evaluation under the same key, so the wandb panel gets a step slider
         fig, axes = plt.subplots(2, 3, figsize=(15, 7), sharey=True)
-        for ax, row in zip(axes.flat, self.mc_rows[:6], strict=False):
+        rows = self.splits.get("train", self.splits.get("heldout"))
+        for ax, row in zip(axes.flat, rows[:6], strict=False):
             ax.plot(self.mc_values(trainer, row).cpu(), label="value function")
             mc_tokens = range(0, len(row["completion_token_ids"]), self.mc_eval_interval)
             ax.plot(mc_tokens, row["values"], "o-", label="Monte Carlo")
